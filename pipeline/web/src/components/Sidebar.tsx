@@ -247,6 +247,29 @@ export function Sidebar({
         </span>
         <span className="text-zinc-600">syncs every 5s</span>
       </div>
+      <div className="px-3 py-2 border-t border-zinc-800 flex items-center justify-center gap-3 text-[10px] text-zinc-500">
+        <a
+          href="https://github.com/hemangjoshi37a/object-talk-pipeline"
+          target="_blank"
+          rel="noreferrer"
+          className="hover:text-zinc-200 transition flex items-center gap-1"
+          title="View source on GitHub"
+        >
+          <span aria-hidden>★</span>
+          <span>GitHub</span>
+        </a>
+        <span className="text-zinc-700">·</span>
+        <a
+          href="https://hjlabs.in"
+          target="_blank"
+          rel="noreferrer"
+          className="hover:text-emerald-400 transition flex items-center gap-1"
+          title="hjLabs — parent company"
+        >
+          <span aria-hidden>🌐</span>
+          <span>hjLabs.in</span>
+        </a>
+      </div>
     </aside>
   );
 }

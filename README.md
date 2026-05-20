@@ -15,6 +15,17 @@ Hindi, merged into a single YouTube Short and auto-uploaded — fully hands-off.
 
 ---
 
+## Live examples — Shorts produced by this pipeline
+
+| | | |
+|---|---|---|
+| [▶ Smart Factory Heroes](https://youtube.com/shorts/AbIxt_bP7FQ) | [▶ Indian Street Food](https://youtube.com/shorts/L_ANLwXPGcM) | [▶ Breakfast Superfoods](https://youtube.com/shorts/8V-eQM8zLcQ) |
+| [▶ EV Charging](https://youtube.com/shorts/Ns0Y0-VF56c) | [▶ Monsoon Snacks](https://youtube.com/shorts/WVTmfwQ8vDE) | [▶ Types of Springs](https://youtube.com/shorts/SS92CmARvn8) |
+
+> 🌐 Built by [hjLabs.in](https://hjlabs.in)
+
+---
+
 ## What it does
 
 Each run produces a 50-second YouTube Short composed of **5 ten-second clips**.
@@ -257,3 +268,23 @@ MIT — see [LICENSE](LICENSE).
 - **Google Gemini** for text + image generation
 - **CloakBrowser** for stealth Chromium
 - **xAI / Google Trends RSS** for live trending data
+
+---
+
+## Contact
+
+**Hemang Joshi** -- Founder, [hjLabs.in](https://hjlabs.in)
+
+[![Email](https://img.shields.io/badge/Email-hemangjoshi37a@gmail.com-EA4335?style=for-the-badge&logo=gmail&logoColor=white)](mailto:hemangjoshi37a@gmail.com)
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-Hemang_Joshi-0A66C2?style=for-the-badge&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/hemang-joshi-046746aa)
+[![YouTube](https://img.shields.io/badge/YouTube-@HemangJoshi-FF0000?style=for-the-badge&logo=youtube&logoColor=white)](https://www.youtube.com/@HemangJoshi)
+[![WhatsApp](https://img.shields.io/badge/WhatsApp-+91_7016525813-25D366?style=for-the-badge&logo=whatsapp&logoColor=white)](https://wa.me/917016525813)
+[![Telegram](https://img.shields.io/badge/Telegram-@hjlabs-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/hjlabs)
+
+**hjLabs.in** -- Industrial Automation | AI/ML | IoT | SEO Tools
+
+Serving **15+ countries** with a **4.9 Google rating**
+
+[![Website](https://img.shields.io/badge/%F0%9F%8C%90_hjLabs.in-Visit_Website-4f46e5?style=for-the-badge)](https://hjlabs.in)
+
+---
