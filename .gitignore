@@ -1,0 +1,99 @@
+# =============================================================================
+#  SECRETS — never commit
+# =============================================================================
+# .env files (contain GEMINI_API_KEY etc). .env.example IS tracked as a template.
+.env
+.env.local
+.env.*.local
+pipeline/.env
+
+# OAuth client secret JSONs (downloaded from Google Cloud Console)
+**/client_secret*.json
+**/credentials.json
+**/token.json
+
+# Cached browser sessions (Grok login cookies, CloakBrowser profile, etc.)
+pipeline/browser_data/
+**/browser_data/
+
+# YouTube MCP cached creds (lives outside repo but defensive)
+.youtube-mcp/
+
+# =============================================================================
+#  GENERATED ARTIFACTS — heavy, regenerable, per-user
+# =============================================================================
+# Pipeline outputs: scripts.json, generated images, generated MP4s, merged video,
+# YouTube metadata. All regenerable from the pipeline; not worth bloating the repo.
+pipeline/output/*
+!pipeline/output/.gitkeep
+
+# Legacy / scratch directory (kept on disk locally, not pushed)
+pipeline/old/
+
+# Per-action subprocess logs
+pipeline/output/**/_regen_*.log
+/tmp/objtalk-*.log
+
+# Playwright MCP session captures (debugging artifacts)
+.playwright-mcp/
+
+# Test/debug captures dumped during development
+/tmp/grok_inspect/
+/tmp/grok_post_gen/
+/tmp/grok_video_mode/
+
+# =============================================================================
+#  PYTHON
+# =============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# =============================================================================
+#  NODE / FRONTEND
+# =============================================================================
+node_modules/
+pipeline/web/node_modules/
+pipeline/web/dist/
+pipeline/web/.vite/
+pipeline/web/tsconfig.tsbuildinfo
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# =============================================================================
+#  EDITORS / OS
+# =============================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# =============================================================================
+#  LOCAL CLAUDE CODE STATE (per-machine, not portable)
+# =============================================================================
+.claude/
+
+# =============================================================================
+#  ROOT-LEVEL ONE-OFFS (kept outside repo)
+# =============================================================================
+# Old scratch scripts at the repo root, kept locally
+/upload_to_youtube.py
+/merge_videos.py
+/merge.mp4
+/Generated*.jpg
+/grok-video-*.mp4

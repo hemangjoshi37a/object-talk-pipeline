@@ -1,0 +1,61 @@
+// 50 seed subjects for Object Talk style Hindi Reels.
+// Chosen for: concrete domain, 5 distinct personifiable objects, broad audience appeal.
+export const SEED_IDEAS: string[] = [
+  // Food / fruits / vegetables
+  'Indian street food',
+  'breakfast superfoods',
+  'monsoon snacks',
+  'tropical fruits',
+  'leafy green vegetables',
+  'desi sweets and mithai',
+  'protein-rich Indian foods',
+  'detox drinks for summer',
+  'budget-friendly groceries',
+  'homemade Indian pickles',
+  // Health / fitness
+  'home gym equipment',
+  'yoga props and accessories',
+  'morning fitness routine',
+  'Ayurvedic herbs for daily health',
+  'gut health essentials',
+  'eye care daily habits',
+  'skincare routine basics',
+  'hair care natural remedies',
+  'immunity boosting foods',
+  'monsoon health essentials',
+  // Home / appliances
+  'kitchen appliances every home needs',
+  'monsoon home essentials',
+  'energy-saving home devices',
+  'water purifier types',
+  'modern bathroom fittings',
+  'home cleaning essentials',
+  'study room essentials for students',
+  'newborn baby essentials',
+  'smart home gadgets',
+  'home security devices',
+  // Vehicles / transport
+  'electric vehicle charging',
+  'bike maintenance essentials',
+  'monsoon car care',
+  'family road trip checklist',
+  'two-wheeler safety gear',
+  // Tools / DIY / work
+  'carpentry tools for beginners',
+  'gardening tools and tips',
+  'farming equipment basics',
+  'mechanic shop tools',
+  'painter and artist supplies',
+  // Industry / tech
+  'smart factory automation',
+  'solar power for homes',
+  'mobile photography accessories',
+  'work from home essentials',
+  'student tech essentials',
+  // Daily life / lifestyle
+  'wedding planning essentials',
+  'monsoon wardrobe essentials',
+  'travel kit must-haves',
+  'office desk productivity items',
+  'pet care essentials for dog owners',
+];
