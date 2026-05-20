@@ -1,0 +1,50 @@
+LinkedIn cover image — meta-prompt
+Paste this into any image generator (Midjourney, Gemini Nano-Banana /
+gemini-2.5-flash-image, Flux, Imagen, ChatGPT/DALL-E, etc.) and save the
+result to: docs/screenshots/linkedin-cover.png
+
+The LinkedIn article (docs/LINKEDIN_ARTICLE.md) already references that path,
+so once the file is present the article will render the cover automatically.
+
+────────────────────────────────────────────────────────────────────────────
+
+Cinematic 16:9 widescreen hero illustration of an AI-powered content pipeline
+depicted as a sleek, futuristic industrial conveyor belt running diagonally
+across the frame from lower-left to upper-right.
+
+On the conveyor, five distinct Pixar-style stylized 3D character-objects are
+lined up in sequence:
+  1. A friendly chrome robotic arm with large expressive animated eyes
+  2. A chunky industrial sensor character with a glowing amber LED eye
+  3. A square PLC controller box with a tiny cute face and rounded edges
+  4. A coiled conveyor-belt motor character with a small mouth
+  5. A small tripod-mounted security camera character
+
+Each character is rendered with rounded, plush, expressive proportions
+reminiscent of Pixar's stylization, all of them subtly facing the viewer.
+
+At the upper-right terminus of the conveyor, the characters flow into a
+stylized translucent vertical phone screen (YouTube Shorts shape, 9:16) that
+displays a glowing white play-triangle glyph in the center.
+
+Ribbons of glowing emerald-green and warm amber data streams arc between the
+characters, suggesting flow and processing.
+
+Floating above and behind the pipeline, semi-transparent holographic UI
+panels display abstract code-flow lines, JSON-shaped brackets, waveform bars,
+and node-graph diagrams in faint emerald-green glow.
+
+Lighting:
+  • Dark zinc-gray atmospheric background with deep shadows
+  • Emerald-green and warm amber rim-lighting on the characters
+  • Volumetric fog + faint particle dust drifting through light beams
+  • Subtle film-grain texture
+  • Shallow depth of field, characters mid-belt in sharp focus
+
+Style: hyper-detailed photorealistic 3D render, cinematic composition.
+No text, no letters, no words, no logos, no watermarks anywhere.
+
+Aspect ratio:  16:9 widescreen (1536×1024 or larger)
+Color palette: dark zinc (#18181b) base
+               emerald (#10b981) accents
+               warm amber (#f59e0b) highlights
