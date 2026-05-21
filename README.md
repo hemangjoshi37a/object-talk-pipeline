@@ -9,7 +9,6 @@
   <img src="https://img.shields.io/badge/license-MIT-emerald?style=for-the-badge" alt="MIT License" />
   <img src="https://img.shields.io/badge/python-3.13-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.13" />
   <img src="https://img.shields.io/badge/node-20%2B-339933?style=for-the-badge&logo=node.js&logoColor=white" alt="Node 20+" />
-  <img src="https://img.shields.io/badge/built%20with-Claude%20Code-DE7356?style=for-the-badge" alt="Built with Claude Code" />
   <a href="https://hjlabs.in"><img src="https://img.shields.io/badge/by-hjLabs.in-4f46e5?style=for-the-badge" alt="hjLabs.in" /></a>
 </p>
 
