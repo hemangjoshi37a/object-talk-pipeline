@@ -1,28 +1,93 @@
-# Object Talk Pipeline — Hindi YouTube Shorts in one click
+<div align="center">
 
-End-to-end pipeline for the **Object Talk 2.0 (Hindi)** Reels format: pick a
-subject, get 5 personified Pixar-style 3D characters talking to camera in
-Hindi, merged into a single YouTube Short and auto-uploaded — fully hands-off.
+# Object Talk Pipeline
 
-| | |
-|---|---|
-| **Stack** | FastAPI + Vite + React + TypeScript + Tailwind |
-| **AI** | Gemini (scripts + images + metadata + trending curation) |
-| **Video** | Grok Imagine via stealth Playwright (CloakBrowser) |
-| **Upload** | YouTube Data API v3 (OAuth) |
+### Hindi YouTube Shorts in one click — from a single subject to an uploaded Reel, fully hands-off.
 
-![Auto run landing page](docs/screenshots/01-auto-run.png)
+<p>
+  <img src="https://img.shields.io/badge/license-MIT-emerald?style=for-the-badge" alt="MIT License" />
+  <img src="https://img.shields.io/badge/python-3.13-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.13" />
+  <img src="https://img.shields.io/badge/node-20%2B-339933?style=for-the-badge&logo=node.js&logoColor=white" alt="Node 20+" />
+  <img src="https://img.shields.io/badge/built%20with-Claude%20Code-DE7356?style=for-the-badge" alt="Built with Claude Code" />
+  <a href="https://hjlabs.in"><img src="https://img.shields.io/badge/by-hjLabs.in-4f46e5?style=for-the-badge" alt="hjLabs.in" /></a>
+</p>
+
+<p>
+  <img src="https://img.shields.io/badge/FastAPI-009688?style=flat-square&logo=fastapi&logoColor=white" alt="FastAPI" />
+  <img src="https://img.shields.io/badge/Vite-646CFF?style=flat-square&logo=vite&logoColor=white" alt="Vite" />
+  <img src="https://img.shields.io/badge/React-61DAFB?style=flat-square&logo=react&logoColor=black" alt="React" />
+  <img src="https://img.shields.io/badge/TypeScript-3178C6?style=flat-square&logo=typescript&logoColor=white" alt="TypeScript" />
+  <img src="https://img.shields.io/badge/Tailwind-06B6D4?style=flat-square&logo=tailwindcss&logoColor=white" alt="Tailwind" />
+  <img src="https://img.shields.io/badge/Gemini-8E75B2?style=flat-square&logo=google&logoColor=white" alt="Gemini" />
+  <img src="https://img.shields.io/badge/Grok%20Imagine-000000?style=flat-square&logo=x&logoColor=white" alt="Grok Imagine" />
+  <img src="https://img.shields.io/badge/YouTube%20Data%20API-FF0000?style=flat-square&logo=youtube&logoColor=white" alt="YouTube Data API" />
+  <img src="https://img.shields.io/badge/Playwright-2EAD33?style=flat-square&logo=playwright&logoColor=white" alt="Playwright" />
+  <img src="https://img.shields.io/badge/ffmpeg-007808?style=flat-square&logo=ffmpeg&logoColor=white" alt="ffmpeg" />
+</p>
+
+<a href="docs/screenshots/01-auto-run.png">
+  <img src="docs/screenshots/01-auto-run.png" alt="Auto run landing page" width="900" />
+</a>
+
+<sub><i>Pick a subject. Get 5 personified Pixar-style 3D characters talking Hindi to camera, merged into a 50-second YouTube Short, auto-uploaded.</i></sub>
+
+</div>
+
+---
+
+<details>
+<summary><b>📑 Table of Contents</b></summary>
+
+- [Live examples](#live-examples--shorts-produced-by-this-pipeline)
+- [What it does](#what-it-does)
+- [Highlights](#highlights)
+- [Quickstart](#quickstart)
+- [Architecture](#architecture)
+- [API surface](#api-surface)
+- [Costs](#costs-rough-per-full-pipeline-run)
+- [Notable design decisions](#notable-design-decisions)
+- [Troubleshooting](#troubleshooting)
+- [License](#license)
+- [Contact](#contact)
+
+</details>
 
 ---
 
 ## Live examples — Shorts produced by this pipeline
 
-| | | |
-|---|---|---|
-| [▶ Smart Factory Heroes](https://youtube.com/shorts/AbIxt_bP7FQ) | [▶ Indian Street Food](https://youtube.com/shorts/L_ANLwXPGcM) | [▶ Breakfast Superfoods](https://youtube.com/shorts/8V-eQM8zLcQ) |
-| [▶ EV Charging](https://youtube.com/shorts/Ns0Y0-VF56c) | [▶ Monsoon Snacks](https://youtube.com/shorts/WVTmfwQ8vDE) | [▶ Types of Springs](https://youtube.com/shorts/SS92CmARvn8) |
+<table>
+<tr>
+  <td align="center" width="33%">
+    <a href="https://youtube.com/shorts/AbIxt_bP7FQ"><img src="https://img.youtube.com/vi/AbIxt_bP7FQ/hqdefault.jpg" width="100%" alt="Smart Factory Heroes" /></a><br/>
+    <a href="https://youtube.com/shorts/AbIxt_bP7FQ"><b>▶ Smart Factory Heroes</b></a>
+  </td>
+  <td align="center" width="33%">
+    <a href="https://youtube.com/shorts/L_ANLwXPGcM"><img src="https://img.youtube.com/vi/L_ANLwXPGcM/hqdefault.jpg" width="100%" alt="Indian Street Food" /></a><br/>
+    <a href="https://youtube.com/shorts/L_ANLwXPGcM"><b>▶ Indian Street Food</b></a>
+  </td>
+  <td align="center" width="33%">
+    <a href="https://youtube.com/shorts/8V-eQM8zLcQ"><img src="https://img.youtube.com/vi/8V-eQM8zLcQ/hqdefault.jpg" width="100%" alt="Breakfast Superfoods" /></a><br/>
+    <a href="https://youtube.com/shorts/8V-eQM8zLcQ"><b>▶ Breakfast Superfoods</b></a>
+  </td>
+</tr>
+<tr>
+  <td align="center" width="33%">
+    <a href="https://youtube.com/shorts/Ns0Y0-VF56c"><img src="https://img.youtube.com/vi/Ns0Y0-VF56c/hqdefault.jpg" width="100%" alt="EV Charging" /></a><br/>
+    <a href="https://youtube.com/shorts/Ns0Y0-VF56c"><b>▶ EV Charging</b></a>
+  </td>
+  <td align="center" width="33%">
+    <a href="https://youtube.com/shorts/WVTmfwQ8vDE"><img src="https://img.youtube.com/vi/WVTmfwQ8vDE/hqdefault.jpg" width="100%" alt="Monsoon Snacks" /></a><br/>
+    <a href="https://youtube.com/shorts/WVTmfwQ8vDE"><b>▶ Monsoon Snacks</b></a>
+  </td>
+  <td align="center" width="33%">
+    <a href="https://youtube.com/shorts/SS92CmARvn8"><img src="https://img.youtube.com/vi/SS92CmARvn8/hqdefault.jpg" width="100%" alt="Types of Springs" /></a><br/>
+    <a href="https://youtube.com/shorts/SS92CmARvn8"><b>▶ Types of Springs</b></a>
+  </td>
+</tr>
+</table>
 
-> 🌐 Built by [hjLabs.in](https://hjlabs.in)
+<p align="center"><sub>🌐 Built by <a href="https://hjlabs.in">hjLabs.in</a> · Founder <a href="https://www.linkedin.com/in/hemang-joshi-046746aa">Hemang Joshi</a></sub></p>
 
 ---
 
@@ -31,17 +96,28 @@ Hindi, merged into a single YouTube Short and auto-uploaded — fully hands-off.
 Each run produces a 50-second YouTube Short composed of **5 ten-second clips**.
 Each clip stars a personified 3D character (e.g. "Robotic Arm", "Mango", "PLC
 Controller") confronting the viewer in Hindi about a relatable problem in that
-domain. The 5 steps:
+domain.
 
-```
-Scripts ──▶ Images ──▶ Videos ──▶ Merge ──▶ Upload
-(Gemini)   (Gemini)   (Grok)     (ffmpeg)   (YouTube)
-```
+<table align="center">
+<tr>
+  <td align="center"><b>1. Scripts</b><br/><sub>Gemini text</sub></td>
+  <td align="center">→</td>
+  <td align="center"><b>2. Images</b><br/><sub>Gemini image</sub></td>
+  <td align="center">→</td>
+  <td align="center"><b>3. Videos</b><br/><sub>Grok Imagine</sub></td>
+  <td align="center">→</td>
+  <td align="center"><b>4. Merge</b><br/><sub>ffmpeg</sub></td>
+  <td align="center">→</td>
+  <td align="center"><b>5. Upload</b><br/><sub>YouTube API</sub></td>
+</tr>
+</table>
 
 **Two modes:**
 
-- **Auto run** — full pipeline runs end-to-end (~5–7 min per video).
-- **Manual run** — only scripts auto-generate; you trigger each image/clip/merge/upload yourself.
+| | |
+|---|---|
+| **⚡ Auto run** | Full pipeline runs end-to-end (~5–7 min per video). |
+| **✋ Manual run** | Only scripts auto-generate; you trigger each image / clip / merge / upload step. |
 
 ---
 
