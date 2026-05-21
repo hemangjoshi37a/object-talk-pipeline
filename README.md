@@ -3,6 +3,7 @@
 # Object Talk Pipeline
 
 ### Hindi YouTube Shorts in one click — from a single subject to an uploaded Reel, fully hands-off.
+<img width="1376" height="768" alt="Generated Image May 20, 2026 - 10_20PM" src="https://github.com/user-attachments/assets/63b8885e-e0d4-4d41-ab4c-2d3cebe531ed" />
 
 <p>
   <img src="https://img.shields.io/badge/license-MIT-emerald?style=for-the-badge" alt="MIT License" />
