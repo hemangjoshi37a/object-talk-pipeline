@@ -3,6 +3,8 @@
 export type RunStatus = 'idle' | 'running' | 'done' | 'error' | 'cancelled';
 export type StepName = 'scripts' | 'images' | 'videos' | 'merge' | 'upload';
 
+export type ErrorKind = 'grok_quota' | null;
+
 export interface Run {
   id: string;             // == slug == output dir name
   subject: string;
@@ -15,6 +17,8 @@ export interface Run {
   artifacts: Artifacts;
   is_active: boolean;     // a worker is currently running it
   log_tail: string[];     // last N log lines (for snapshot)
+  error_kind?: ErrorKind;
+  error_message?: string | null;
 }
 
 export interface Artifacts {
@@ -48,6 +52,7 @@ export interface Script {
   object: string;
   image_prompt: string;
   hindi_script: string;
+  action_script?: string;  // optional for back-compat with older runs
   word_count: number;
 }
 
@@ -118,11 +123,29 @@ export const api = {
   async regenImage(id: string, idx: number): Promise<Run> {
     return j<Run>(await fetch(`/api/runs/${id}/regen/image/${idx}`, { method: 'POST' }));
   },
+  async regenScript(id: string, idx: number, hint?: string): Promise<Run> {
+    return j<Run>(
+      await fetch(`/api/runs/${id}/regen/script/${idx}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hint: hint || null }),
+      }),
+    );
+  },
   async regenVideo(id: string, idx: number): Promise<Run> {
     return j<Run>(await fetch(`/api/runs/${id}/regen/video/${idx}`, { method: 'POST' }));
   },
   async manualMerge(id: string): Promise<Run> {
     return j<Run>(await fetch(`/api/runs/${id}/merge`, { method: 'POST' }));
+  },
+  async setYouTubeUrl(id: string, url: string | null): Promise<Run> {
+    return j<Run>(
+      await fetch(`/api/runs/${id}/youtube_url`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url }),
+      }),
+    );
   },
   async manualUpload(id: string, privacy: 'public' | 'unlisted' | 'private' = 'public'): Promise<Run> {
     return j<Run>(

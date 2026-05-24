@@ -38,6 +38,11 @@ def main() -> int:
                         help="Run image generations concurrently and use multi-tab video generation")
     args = parser.parse_args()
 
+    # Distinct exit code for Grok quota-exhausted so the webapp can render a
+    # different error than a generic failure (and so the user knows the only
+    # remedy is to wait + retry from the videos step).
+    QUOTA_EXIT_CODE = 42
+
     out = run_dir(args.subject)
     print(f"\n=== Run dir: {out} ===\n", flush=True)
 
@@ -68,7 +73,14 @@ def main() -> int:
     need_videos = args.from_step in ("scripts", "images", "videos") or len(have_videos) < 5
     if need_videos:
         print(">>> Step 3/5: generate videos via Grok", flush=True)
-        generate_videos.generate_all(scripts_path, out, headless=args.headless, parallel=args.parallel)
+        try:
+            generate_videos.generate_all(scripts_path, out, headless=args.headless, parallel=args.parallel)
+        except generate_videos.GrokQuotaExceeded as e:
+            # Don't let the traceback flood the log — emit a clear marker the
+            # webapp can pattern-match on, then exit fast.
+            print(f"\n⛔ {e}", flush=True)
+            print(f"=== {generate_videos.QUOTA_MARKER}: halted before merge/upload ===", flush=True)
+            return QUOTA_EXIT_CODE
         print(flush=True)
     else:
         print(f"--- Step 3/5: {len(have_videos)} videos exist, skip ---\n", flush=True)

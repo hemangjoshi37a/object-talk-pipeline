@@ -11,6 +11,7 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import GEMINI_API_KEY, GEMINI_IMAGE_MODEL
+from http_utils import post_with_retry
 
 ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
 
@@ -28,7 +29,7 @@ def generate_one(prompt: str, out_path_stem: Path) -> Path:
         },
     }
     url = ENDPOINT.format(model=GEMINI_IMAGE_MODEL, key=GEMINI_API_KEY)
-    r = requests.post(url, json=body, timeout=180)
+    r = post_with_retry(url, json=body, timeout=180, label=f"img:{out_path_stem.name}")
     if r.status_code != 200:
         sys.stderr.write(f"Gemini image error {r.status_code}:\n{r.text}\n")
         r.raise_for_status()

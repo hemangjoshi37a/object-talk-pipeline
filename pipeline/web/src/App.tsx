@@ -8,14 +8,84 @@ import { IdeasPanel } from './components/IdeasPanel';
 import { TrendingPanel } from './components/TrendingPanel';
 import { Settings } from './components/Settings';
 
+// Hash-based router (no react-router dep). Single source of truth: location.hash.
+// URL scheme — paste-able + refresh-safe:
+//   #/                       → Auto run landing (default)
+//   #/manual                 → Manual run landing
+//   #/settings               → Settings page
+//   #/run/<id>               → Run detail page
+type Route =
+  | { kind: 'auto' }
+  | { kind: 'manual' }
+  | { kind: 'settings' }
+  | { kind: 'run'; id: string };
+
+function parseHash(hash: string): Route {
+  const h = hash.replace(/^#\/?/, '');
+  if (!h) return { kind: 'auto' };
+  if (h === 'manual') return { kind: 'manual' };
+  if (h === 'settings') return { kind: 'settings' };
+  const m = h.match(/^run\/([^/?]+)/);
+  if (m) return { kind: 'run', id: decodeURIComponent(m[1]) };
+  return { kind: 'auto' };
+}
+
+function routeToHash(r: Route): string {
+  if (r.kind === 'auto') return '#/';
+  if (r.kind === 'manual') return '#/manual';
+  if (r.kind === 'settings') return '#/settings';
+  return `#/run/${encodeURIComponent(r.id)}`;
+}
+
 export default function App() {
   const [runs, setRuns] = useState<Run[]>([]);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const initialRoute = parseHash(window.location.hash);
+  const [selectedId, setSelectedId] = useState<string | null>(
+    initialRoute.kind === 'run' ? initialRoute.id : null,
+  );
   const [currentRun, setCurrentRun] = useState<Run | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
   const [pendingSubject, setPendingSubject] = useState('');
-  const [mode, setMode] = useState<'auto' | 'manual' | 'settings'>('auto');
+  const [mode, setMode] = useState<'auto' | 'manual' | 'settings'>(
+    initialRoute.kind === 'run' ? 'auto' : initialRoute.kind,
+  );
   const sseRef = useRef<EventSource | null>(null);
+
+  // Sync URL hash whenever (selectedId, mode) changes. Use replaceState for
+  // the initial load (so we don't leave an empty history entry), and pushState
+  // for user-driven navigation.
+  const isFirstUrlSync = useRef(true);
+  useEffect(() => {
+    const desired = selectedId !== null
+      ? routeToHash({ kind: 'run', id: selectedId })
+      : routeToHash({ kind: mode });
+    if (window.location.hash === desired || (desired === '#/' && !window.location.hash)) return;
+    if (isFirstUrlSync.current) {
+      isFirstUrlSync.current = false;
+      window.history.replaceState(null, '', desired);
+    } else {
+      window.history.pushState(null, '', desired);
+    }
+  }, [selectedId, mode]);
+
+  // Listen for browser back/forward — re-parse hash and apply to state.
+  useEffect(() => {
+    const onPop = () => {
+      const r = parseHash(window.location.hash);
+      if (r.kind === 'run') {
+        setSelectedId(r.id);
+      } else {
+        setSelectedId(null);
+        setMode(r.kind);
+      }
+    };
+    window.addEventListener('popstate', onPop);
+    window.addEventListener('hashchange', onPop);
+    return () => {
+      window.removeEventListener('popstate', onPop);
+      window.removeEventListener('hashchange', onPop);
+    };
+  }, []);
 
   const completedSubjects = useMemo(
     () => new Set(runs.filter(r => r.status === 'done').map(r => r.id)),

@@ -101,6 +101,38 @@ export function ArtifactsPanel({ run }: { run: Run }) {
   const [error, setError] = useState<string | null>(null);
   const [privacy, setPrivacy] = useState<'public' | 'unlisted' | 'private'>('public');
   const [copied, setCopied] = useState(false);
+  const [manualUrlOpen, setManualUrlOpen] = useState(false);
+  const [manualUrl, setManualUrl] = useState('');
+  const [manualUrlBusy, setManualUrlBusy] = useState(false);
+
+  const submitManualUrl = async () => {
+    const u = manualUrl.trim();
+    if (!u) return;
+    setManualUrlBusy(true);
+    setError(null);
+    try {
+      await api.setYouTubeUrl(run.id, u);
+      setManualUrlOpen(false);
+      setManualUrl('');
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setManualUrlBusy(false);
+    }
+  };
+
+  const clearManualUrl = async () => {
+    if (!confirm('Clear the saved YouTube URL? This is for when the URL was wrong — it does not delete the video on YouTube.')) return;
+    setManualUrlBusy(true);
+    setError(null);
+    try {
+      await api.setYouTubeUrl(run.id, null);
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setManualUrlBusy(false);
+    }
+  };
 
   const clipsReady = artifacts.videos.length;
   const canMerge = clipsReady > 0;
@@ -152,6 +184,31 @@ export function ArtifactsPanel({ run }: { run: Run }) {
         </span>
       </div>
       <div className="flex-1 overflow-y-auto p-3 space-y-5">
+        {/* Distinct banner for the Grok video quota error — appears at the top
+            of the artifacts panel so it's impossible to miss. Surfaces the
+            specific actionable advice (wait + retry from videos step). */}
+        {run.error_kind === 'grok_quota' && (
+          <div className="rounded-lg border border-amber-500/40 bg-gradient-to-br from-amber-500/15 to-amber-500/5 p-4">
+            <div className="flex items-start gap-3">
+              <div className="text-2xl shrink-0">⛔</div>
+              <div className="flex-1 min-w-0">
+                <div className="text-sm font-semibold text-amber-200 mb-1">
+                  Grok video quota exhausted
+                </div>
+                <div className="text-xs text-amber-100/80 leading-relaxed">
+                  Grok refused to start the video generation — its &quot;Upgrade to SuperGrok&quot; modal opened.
+                  This is a rate-limit window, not a bug in the pipeline. Wait a few hours
+                  for the quota to roll over, then click <span className="font-mono px-1 py-0.5 rounded bg-amber-500/20">Retry from… → Videos</span> at
+                  the top of the run page. The scripts and images you already have will be reused.
+                </div>
+                <div className="mt-2 text-[10px] text-amber-100/50 font-mono break-all">
+                  log: {run.error_message || 'GROK_QUOTA_EXCEEDED'}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
         {artifacts.scripts_json ? (
           <ScriptsEditor
             runId={run.id}
@@ -315,6 +372,50 @@ export function ArtifactsPanel({ run }: { run: Run }) {
 
           {busy === 'upload' && <BusyHint kind="upload" startedAt={busyStart} />}
 
+          {/* Manual-URL fallback: useful when the upload step crashed/aborted but
+              the video actually made it to YouTube, OR for fixing an incorrect URL. */}
+          {!run.youtube_url && (
+            <div className="mt-2 text-[11px]">
+              {!manualUrlOpen ? (
+                <button
+                  onClick={() => setManualUrlOpen(true)}
+                  className="text-zinc-500 hover:text-zinc-300 underline-offset-2 hover:underline transition"
+                  title="If the video was uploaded but the URL wasn't captured, paste it here"
+                >
+                  ✎ Already on YouTube? Paste URL manually
+                </button>
+              ) : (
+                <div className="flex flex-wrap items-center gap-1.5 mt-1">
+                  <input
+                    autoFocus
+                    type="url"
+                    value={manualUrl}
+                    onChange={e => setManualUrl(e.target.value)}
+                    onKeyDown={e => { if (e.key === 'Enter') submitManualUrl(); if (e.key === 'Escape') { setManualUrlOpen(false); setManualUrl(''); } }}
+                    placeholder="https://youtube.com/shorts/XXXXXXXXXXX"
+                    className="flex-1 min-w-[220px] px-2 py-1 text-xs font-mono bg-zinc-950 border border-zinc-700 rounded
+                               focus:outline-none focus:border-emerald-500"
+                    disabled={manualUrlBusy}
+                  />
+                  <button
+                    onClick={submitManualUrl}
+                    disabled={manualUrlBusy || !manualUrl.trim()}
+                    className="px-2 py-1 text-[11px] rounded border border-emerald-500/40 bg-emerald-500/10 text-emerald-300
+                               hover:bg-emerald-500/20 disabled:opacity-40 transition"
+                  >
+                    {manualUrlBusy ? '…' : 'Save'}
+                  </button>
+                  <button
+                    onClick={() => { setManualUrlOpen(false); setManualUrl(''); }}
+                    className="px-2 py-1 text-[11px] rounded border border-zinc-700 text-zinc-400 hover:text-zinc-200 transition"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
           {run.youtube_url && (
             <div className="mt-3 rounded-md border border-emerald-500/30 bg-gradient-to-br from-emerald-500/10 to-emerald-500/5 p-3">
               <div className="flex items-center gap-2 mb-2">
@@ -349,6 +450,53 @@ export function ArtifactsPanel({ run }: { run: Run }) {
                 >
                   ↗ Open
                 </a>
+              </div>
+              <div className="mt-2 flex items-center gap-2 text-[10px] text-zinc-500">
+                {!manualUrlOpen ? (
+                  <>
+                    <button
+                      onClick={() => { setManualUrl(run.youtube_url || ''); setManualUrlOpen(true); }}
+                      className="hover:text-zinc-300 underline-offset-2 hover:underline transition"
+                      title="Replace the saved URL"
+                    >
+                      ✎ Edit URL
+                    </button>
+                    <span className="text-zinc-700">·</span>
+                    <button
+                      onClick={clearManualUrl}
+                      disabled={manualUrlBusy}
+                      className="hover:text-red-400 underline-offset-2 hover:underline transition"
+                      title="Clear (does not delete on YouTube)"
+                    >
+                      ✕ Clear
+                    </button>
+                  </>
+                ) : (
+                  <div className="flex flex-wrap items-center gap-1.5 w-full">
+                    <input
+                      autoFocus
+                      type="url"
+                      value={manualUrl}
+                      onChange={e => setManualUrl(e.target.value)}
+                      onKeyDown={e => { if (e.key === 'Enter') submitManualUrl(); if (e.key === 'Escape') { setManualUrlOpen(false); setManualUrl(''); } }}
+                      className="flex-1 min-w-[220px] px-2 py-1 text-xs font-mono bg-zinc-950 border border-zinc-700 rounded focus:outline-none focus:border-emerald-500"
+                      disabled={manualUrlBusy}
+                    />
+                    <button
+                      onClick={submitManualUrl}
+                      disabled={manualUrlBusy || !manualUrl.trim()}
+                      className="px-2 py-1 text-[11px] rounded border border-emerald-500/40 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20 disabled:opacity-40 transition"
+                    >
+                      {manualUrlBusy ? '…' : 'Save'}
+                    </button>
+                    <button
+                      onClick={() => { setManualUrlOpen(false); setManualUrl(''); }}
+                      className="px-2 py-1 text-[11px] rounded border border-zinc-700 text-zinc-400 hover:text-zinc-200 transition"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
           )}

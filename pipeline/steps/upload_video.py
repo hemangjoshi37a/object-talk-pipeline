@@ -18,6 +18,7 @@ from config import (
     GEMINI_API_KEY, GEMINI_TEXT_MODEL,
     YOUTUBE_TOKEN_PATH, YOUTUBE_CLIENT_SECRET,
 )
+from http_utils import post_with_retry
 
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload",
@@ -25,11 +26,19 @@ SCOPES = ["https://www.googleapis.com/auth/youtube.upload",
 
 METADATA_PROMPT = """Given the subject and 5 Object-Talk Hindi scripts below, produce YouTube metadata for a 50-second Shorts upload that combines all 5 clips.
 
+ZERO-HALLUCINATION RULES (these override creative latitude):
+- Use ONLY the 5 object names exactly as they appear in the scripts below — do not rename, abbreviate, or invent variants
+- Do NOT invent numeric statistics ("makes it 3x faster", "lasts 10 years") — use qualitative language only
+- Do NOT invent brand names, product models, certifications, standards, or awards
+- Do NOT make medical, financial, or safety claims that aren't generic common knowledge
+- Tags must be real searchable terms in the domain, not fabricated phrases
+- The description's bullet list MUST reflect the real function of each object as stated in the scripts — do not add facts not present in the scripts
+
 Return strict JSON only:
 {
-  "title": "<≤95 chars, Hindi+English mix, must include the 5 object names, attention-grabbing, no emojis>",
-  "description": "<3-6 short paragraphs (Hindi+English): a hook, a bulleted list naming all 5 objects with 1 line each, a Shorts hashtag block at the end. 800-1500 chars total. Use the exact Hindi script vibes as flavor. No emojis.>",
-  "tags": ["<15-25 SEO tags, mix of English and Hindi/Hinglish, lowercase, no #>"],
+  "title": "<≤95 chars, Hindi+English mix, must include the 5 object names verbatim, attention-grabbing, no emojis, no fake stats>",
+  "description": "<3-6 short paragraphs (Hindi+English): a hook, a bulleted list naming all 5 objects with 1 line each describing ONLY their real function from the scripts, a Shorts hashtag block at the end. 800-1500 chars total. No invented numbers, no fake brand mentions, no emojis.>",
+  "tags": ["<15-25 SEO tags, mix of English and Hindi/Hinglish, lowercase, no #, only real domain terms>"],
   "category_id": "<one of: 22 (People&Blogs), 27 (Education), 28 (Sci&Tech), 26 (How-to)>"
 }
 
@@ -59,7 +68,7 @@ def generate_metadata(subject: str, scripts_payload: dict) -> dict:
         },
     }
     url = GEMINI_ENDPOINT.format(model=GEMINI_TEXT_MODEL, key=GEMINI_API_KEY)
-    r = requests.post(url, json=body, timeout=120)
+    r = post_with_retry(url, json=body, timeout=120, label="metadata")
     r.raise_for_status()
     text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
     meta = json.loads(text)

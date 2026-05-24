@@ -65,6 +65,12 @@ class RunBus:
         self.step_progress: dict | None = None
         self.youtube_url: str | None = None
         self.subject: str | None = None
+        # error_kind: a coarse category for the most recent failure so the UI
+        # can render a distinct banner. Set by _parse_line on specific markers.
+        #   "grok_quota"   — Grok rate-limited; user must wait + retry from videos
+        #   None           — no specific error, fall back to generic "error" status
+        self.error_kind: str | None = None
+        self.error_message: str | None = None  # human-readable context line
         self.created_at = time.time()
         self.updated_at = self.created_at
         self.condition = asyncio.Condition()
@@ -201,6 +207,13 @@ class Job:
         if m:
             bus.youtube_url = m.group(1)
             bus.emit("youtube", bus.youtube_url)
+            return
+        # Grok quota — set a distinct error_kind so the UI can show a clear,
+        # non-scary "Wait for quota reset" banner instead of a raw stack trace.
+        if "GROK_QUOTA_EXCEEDED" in line:
+            bus.error_kind = "grok_quota"
+            bus.error_message = line.strip()
+            bus.emit("error_kind", {"kind": "grok_quota", "message": line.strip()})
 
     def _artifact_scanner(self) -> None:
         last_snapshot: dict | None = None
@@ -292,6 +305,17 @@ def run_dict(run_id: str) -> dict:
     is_active = bool(bus and bus.active_jobs > 0)
     created_at = bus.created_at if bus else (d.stat().st_mtime if d.exists() else 0)
     updated_at = bus.updated_at if bus else (d.stat().st_mtime if d.exists() else 0)
+    # error_kind/message survive even without a live bus by scanning the
+    # persisted log tail for the GROK_QUOTA marker — so reopening the page
+    # after a failed run still shows the clear banner instead of "error".
+    error_kind = bus.error_kind if bus else None
+    error_message = bus.error_message if bus else None
+    if status == "error" and error_kind is None and bus:
+        for line in reversed(bus.log[-200:]):
+            if "GROK_QUOTA_EXCEEDED" in line:
+                error_kind = "grok_quota"
+                error_message = line.strip()
+                break
     return {
         "id": run_id,
         "subject": subject,
@@ -304,6 +328,8 @@ def run_dict(run_id: str) -> dict:
         "artifacts": arts,
         "is_active": is_active,
         "log_tail": (bus.log[-300:] if bus else []),
+        "error_kind": error_kind,
+        "error_message": error_message,
     }
 
 
@@ -499,6 +525,29 @@ def _subject_for(run_id: str) -> str:
     return run_id
 
 
+class RegenScriptOpts(BaseModel):
+    hint: str | None = None
+
+
+@app.post("/api/runs/{run_id}/regen/script/{idx}")
+async def regen_one_script(run_id: str, idx: int, opts: RegenScriptOpts | None = None) -> dict:
+    """Regenerate a single script slot (1..5) keeping the other 4 intact.
+    Aux job — concurrent with image/video regens (no Chrome lock involved)."""
+    if idx < 1 or idx > 5:
+        raise HTTPException(400, "idx must be 1..5")
+    d = OUTPUT_DIR / run_id
+    if not (d / "scripts.json").exists():
+        raise HTTPException(404, "no scripts.json — generate scripts first")
+    subject = _subject_for(run_id)
+    cmd = [PYTHON, "-u", str(ROOT / "steps" / "generate_scripts.py"),
+           subject, "--out", str(d / "scripts.json"),
+           "--only", str(idx)]
+    if opts and opts.hint:
+        cmd.extend(["--hint", opts.hint])
+    _spawn_aux_job(run_id, cmd, label=f"regen-script-{idx}")
+    return run_dict(run_id)
+
+
 @app.post("/api/runs/{run_id}/regen/image/{idx}")
 async def regen_image(run_id: str, idx: int) -> dict:
     """Regenerate a single image as an AUX job so multiple regens can run
@@ -560,6 +609,44 @@ async def manual_upload(run_id: str, opts: UploadOptions) -> dict:
     cmd = [PYTHON, "-u", str(ROOT / "steps" / "upload_video.py"),
            str(merged), str(scripts), "--privacy", opts.privacy]
     _spawn_step_job(run_id, _subject_for(run_id), cmd, step="upload")
+    return run_dict(run_id)
+
+
+class YouTubeUrlBody(BaseModel):
+    url: str | None = None  # null/empty clears the URL
+
+
+_YT_URL_RE = re.compile(
+    r"^https?://(?:www\.|m\.)?(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)"
+    r"([A-Za-z0-9_-]{11})(?:[/?&].*)?$"
+)
+
+
+@app.put("/api/runs/{run_id}/youtube_url")
+async def set_youtube_url(run_id: str, body: YouTubeUrlBody) -> dict:
+    """Manually set or clear the YouTube URL for a run.
+
+    Useful when the upload step succeeded on YouTube but the pipeline failed to
+    capture the URL (e.g. the upload subprocess died after the API call but
+    before writing youtube_url.txt). Pass null or "" to clear.
+    """
+    d = OUTPUT_DIR / run_id
+    if not d.exists():
+        raise HTTPException(404, "no such run")
+    yt_file = d / "youtube_url.txt"
+    url = (body.url or "").strip()
+    if url:
+        if not _YT_URL_RE.match(url):
+            raise HTTPException(400, "URL must look like https://youtube.com/shorts/<id> or https://youtu.be/<id>")
+        yt_file.write_text(url + "\n")
+    else:
+        if yt_file.exists():
+            yt_file.unlink()
+    # Push to live bus if there is one so the SSE stream picks it up
+    bus = BUSES.get(run_id)
+    if bus is not None:
+        bus.youtube_url = url or None
+        bus.emit("youtube", url or "")
     return run_dict(run_id)
 
 
@@ -1045,9 +1132,30 @@ if WEB_DIST.exists():
 def main() -> int:
     import uvicorn
     port = int(os.environ.get("PORT", "8765"))
-    print(f"Object Talk webapp on http://localhost:{port}", flush=True)
+    # Auto-reload on Python file changes by default (no need to restart the
+    # backend after every code edit). Disable by exporting OBJTALK_NO_RELOAD=1
+    # for clean production runs.
+    auto_reload = os.environ.get("OBJTALK_NO_RELOAD") != "1"
+    reload_dirs: list[str] | None = None
+    if auto_reload:
+        reload_dirs = [str(ROOT), str(ROOT / "steps")]
+    print(f"Object Talk webapp on http://localhost:{port}"
+          + (" (auto-reload ON)" if auto_reload else ""), flush=True)
     print(f"  Frontend dev: cd web && npm run dev  (proxies /api → :{port})", flush=True)
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
+    if auto_reload:
+        # uvicorn.run with reload=True needs an import string, not the app object,
+        # so it can re-import the module on each restart.
+        uvicorn.run(
+            "webapp:app",
+            host="127.0.0.1",
+            port=port,
+            log_level="info",
+            reload=True,
+            reload_dirs=reload_dirs,
+            reload_excludes=["output/*", "browser_data/*", "web/node_modules/*", "web/dist/*", "*.log"],
+        )
+    else:
+        uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
     return 0
 
 

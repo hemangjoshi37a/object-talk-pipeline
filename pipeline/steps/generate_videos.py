@@ -31,6 +31,50 @@ GROK_URL = "https://grok.com/imagine"
 GEN_TIMEOUT_S = 300  # 5 min per video generation
 GROK_LOCK_WAIT_S = 1800  # wait up to 30 min for browser profile to free up
 
+# Sentinel logged when Grok's video generation quota is exhausted. The web
+# backend parses for this marker to surface a distinct error in the UI and to
+# abort early so we don't keep retrying clip after clip in a futile way.
+QUOTA_MARKER = "GROK_QUOTA_EXCEEDED"
+
+
+class GrokQuotaExceeded(RuntimeError):
+    """Raised when Grok refuses to start a video generation due to limit/quota.
+    Distinct from generic RuntimeError so callers can stop the batch immediately."""
+
+
+def _detect_quota_exceeded(page) -> str | None:
+    """Detect Grok's quota-exceeded gate using EXCLUSIVE signals — i.e. text
+    that only appears when the server returns a 429 rate-limit, never on a
+    healthy page.
+
+    Earlier versions of this detector also matched the "Upgrade to SuperGrok"
+    heading. That turned out to be a false-positive trap: Grok renders the
+    "Upgrade to SuperGrok" string as a persistent CTA next to the resolution
+    selector on every page, regardless of quota state — confirmed live via
+    capture_quota_state.py against a healthy session. Only these two phrases
+    are exclusive to actual server-side rate-limit responses:
+
+      • "Rate limit reached"
+      • "You've reached your limit, come back later"
+
+    Their presence is a high-confidence signal; their absence means the page
+    is healthy. Returns a short diagnostic string when detected, None otherwise.
+    """
+    try:
+        body_text = page.evaluate("() => document.body.innerText || ''") or ""
+    except Exception:
+        return None
+    lower = body_text.lower()
+    # Exclusive signal #1 — Grok's inline rate-limit notice next to the prompt
+    if "rate limit reached" in lower:
+        i = lower.find("rate limit reached")
+        snip = body_text[max(0, i - 40): i + 120].replace("\n", " ").strip()
+        return f"server says \"Rate limit reached\" — context: '{snip}'"
+    # Exclusive signal #2 — the longer server toast
+    if "you've reached your limit, come back later" in lower:
+        return "server rate-limit toast: \"You've reached your limit, come back later.\""
+    return None
+
 
 def _acquire_grok_lock(timeout_s: int = GROK_LOCK_WAIT_S):
     """File-lock on the Grok profile so only one Chrome process uses it at a time.
@@ -166,12 +210,23 @@ def _human_jitter(page, near_x: int | None = None, near_y: int | None = None) ->
 
 
 def _set_prompt(page, text: str) -> None:
-    """Click into the ProseMirror editor and type the prompt humanlike (variable delays)."""
+    """Click into the ProseMirror editor and type the prompt humanlike (variable delays).
+
+    Critical: never type a bare Enter — many chat-style editors (Grok's
+    ProseMirror is one) interpret bare Enter as "submit". Each literal
+    "\\n" in our DIALOGUE/ACTION-formatted prompt would otherwise fire
+    a phantom Submit mid-typing. Use Shift+Enter for soft line breaks.
+    """
     editor = page.locator(".ProseMirror.tiptap").first
     _human_jitter(page)
     editor.click()
     page.wait_for_timeout(random.randint(250, 550))
     for ch in text:
+        if ch == "\n":
+            # Soft line break — doesn't submit the prompt
+            page.keyboard.press("Shift+Enter")
+            page.wait_for_timeout(random.randint(60, 140))
+            continue
         # Most chars 30-90ms (≈12-30 wpm range); occasional brief think-pause
         page.keyboard.type(ch, delay=random.randint(25, 90))
         r = random.random()
@@ -183,15 +238,37 @@ def _set_prompt(page, text: str) -> None:
 
 
 def _submit(page) -> None:
-    """Wait for Submit to enable, then click it."""
+    """Wait for Submit to enable, then click it.
+
+    Two things make this trickier than it looks:
+      • `is_disabled()` carries Playwright's default 30s auto-wait when the
+        locator hasn't settled yet — that swallows the polling loop. We pass
+        an explicit short `timeout=` so each probe is bounded.
+      • The new prompt (DIALOGUE + ACTION) is longer, so Grok takes a few extra
+        seconds to validate the input and enable Submit. Bumped deadline to 60s.
+    """
     sub = page.locator('button[aria-label="Submit"]').first
-    deadline = time.time() + 20
+    deadline = time.time() + 60
+    last_err: Exception | None = None
     while time.time() < deadline:
-        if not sub.is_disabled():
-            sub.click()
-            return
-        page.wait_for_timeout(400)
-    raise RuntimeError("Submit button never became enabled within 20s")
+        try:
+            disabled = sub.is_disabled(timeout=2000)
+        except Exception as e:
+            last_err = e
+            page.wait_for_timeout(500)
+            continue
+        if not disabled:
+            try:
+                sub.click(timeout=5000)
+                return
+            except Exception as e:
+                last_err = e
+                page.wait_for_timeout(500)
+                continue
+        page.wait_for_timeout(500)
+    raise RuntimeError(
+        f"Submit button never became enabled within 60s (last error: {last_err})"
+    )
 
 
 def _dump_post_gen_state(page, label: str) -> None:
@@ -330,7 +407,12 @@ def _download(url: str, out: Path, page=None) -> None:
             print(f"  (Playwright request context: {resp.status} {resp.status_text})")
         except Exception as e:
             print(f"  (Playwright request context failed: {e})")
-    r = requests.get(url, timeout=120, stream=True)
+    # Last-resort fallback: raw requests with retry-on-transient-errors.
+    # Imported here (not top of module) to keep this fallback path lazy and
+    # avoid breaking older deployments that don't have http_utils.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from http_utils import get_with_retry
+    r = get_with_retry(url, timeout=120, stream=True, label=f"video-dl:{out.name}")
     r.raise_for_status()
     with out.open("wb") as f:
         for chunk in r.iter_content(chunk_size=1024 * 64):
@@ -367,6 +449,11 @@ def _ensure_fresh_chat(page) -> None:
 def _setup_and_submit(page, image_path: Path, prompt: str) -> None:
     """The setup phase: reset, configure, upload, prompt, submit. Returns when submit is clicked."""
     _ensure_fresh_chat(page)
+    # Quota check BEFORE we even try to set up — if Grok's landing page already
+    # says we're out of generations, fail fast without wasting time on upload+typing.
+    early = _detect_quota_exceeded(page)
+    if early:
+        raise GrokQuotaExceeded(f"{QUOTA_MARKER}: {early}")
     _switch_to_video_mode(page)
     _set_aspect_9_16(page)
     _set_resolution(page, "720p")
@@ -375,6 +462,11 @@ def _setup_and_submit(page, image_path: Path, prompt: str) -> None:
     _set_prompt(page, prompt)
     _submit(page)
     page.wait_for_timeout(3000)  # allow navigation to start
+    # Post-submit quota check — Grok sometimes only flags the quota after you
+    # click submit (toast appears instead of navigating to the generation view).
+    after = _detect_quota_exceeded(page)
+    if after:
+        raise GrokQuotaExceeded(f"{QUOTA_MARKER}: {after}")
 
 
 def generate_one(page, image_path: Path, prompt: str, out_path: Path) -> None:
@@ -409,21 +501,70 @@ def _collect_pending(scripts, out_dir: Path, only):
     return pending
 
 
+def _build_grok_prompt(s: dict) -> str:
+    """Build the full prompt typed into Grok's text box for a single clip.
+
+    Two clearly labelled sections so Grok knows what the character SAYS
+    (lip-sync source) vs. what the character + camera + scenery DO (motion).
+    The DIALOGUE block is the Hindi script verbatim — Grok lip-syncs to this.
+    The ACTION block is descriptive camera + motion direction.
+
+    Falls back gracefully when older scripts.json files have no action_script.
+    """
+    dialogue = (s.get("hindi_script") or "").strip()
+    action = (s.get("action_script") or "").strip()
+    if not action:
+        # Back-compat: legacy scripts without action_script — just send dialogue
+        # the way we always did.
+        return dialogue
+    return (
+        "DIALOGUE (the character speaks this verbatim in Hindi, lip-sync to it):\n"
+        f"{dialogue}\n\n"
+        "ACTION (camera + character + scenery motion during the clip):\n"
+        f"{action}"
+    )
+
+
 def _generate_parallel(ctx, pending) -> list[Path]:
     """Setup-then-wait pattern: open one tab per pending item, submit all serially,
-    then poll all tabs in parallel for video URLs and download as they complete."""
+    then poll all tabs in parallel for video URLs and download as they complete.
+
+    Per-tab isolation: if one tab fails to set up/submit (Grok UI glitch,
+    Cloudflare challenge, etc.) we mark that slot dead and keep the rest alive.
+    Failed slots are returned to the caller as None so they can be retried serially.
+    """
     if not pending:
         return []
     print(f"(parallel: opening {len(pending)} tabs)", flush=True)
     pages = [ctx.new_page() for _ in pending]
-    # Setup phase — serial per tab, but each tab's "waiting" phase begins as soon as we hit submit
+    # Setup phase — serial per tab, but each tab's "waiting" phase begins as soon as we hit submit.
+    # A failure in one tab MUST NOT abort the others — log it and continue.
+    submitted: list[bool] = [False] * len(pending)
+    setup_errors: list[str | None] = [None] * len(pending)
+    quota_hit = False
     for slot, (idx, s, img, out) in enumerate(pending):
+        if quota_hit:
+            # No point setting up more tabs once Grok said we're out of generations.
+            setup_errors[slot] = "skipped — quota already exhausted"
+            print(f"  [{idx}/5] SKIPPED (quota exhausted on earlier tab)", flush=True)
+            continue
         print(f"[{idx}/5] {s['object']}: setup tab {slot+1}", flush=True)
-        _setup_and_submit(pages[slot], img, s["hindi_script"])
-    # All tabs have submitted. Wait + download whichever finishes first.
-    print(f"  all {len(pending)} submitted; polling for completion...", flush=True)
-    outputs: list[Path] = [None] * len(pending)  # type: ignore
-    finished = [False] * len(pending)
+        try:
+            _setup_and_submit(pages[slot], img, _build_grok_prompt(s))
+            submitted[slot] = True
+        except GrokQuotaExceeded as e:
+            setup_errors[slot] = str(e)[:300]
+            print(f"  [{idx}/5] ✗ {e}", flush=True)
+            print(f"  ⛔ {QUOTA_MARKER}: aborting remaining tabs — won't waste retries.", flush=True)
+            quota_hit = True
+        except Exception as e:
+            setup_errors[slot] = str(e)[:200]
+            print(f"  [{idx}/5] SETUP FAILED — will retry serially after others finish. ({setup_errors[slot]})", flush=True)
+    n_submitted = sum(submitted)
+    print(f"  {n_submitted}/{len(pending)} submitted; polling for completion...", flush=True)
+    outputs: list[Path | None] = [None] * len(pending)
+    finished = [not submitted[i] for i in range(len(pending))]  # tabs that didn't submit are pre-"finished" (skipped)
+    download_attempts: list[dict] = [{"tries": 0, "last_url": None, "last_error": None} for _ in pending]
     deadline = time.time() + GEN_TIMEOUT_S
     while not all(finished) and time.time() < deadline:
         for slot, (idx, s, img, out) in enumerate(pending):
@@ -433,8 +574,10 @@ def _generate_parallel(ctx, pending) -> list[Path]:
             try:
                 urls = page.evaluate("""() => Array.from(document.querySelectorAll('video')).map(v => ({
                     src: v.src || v.currentSrc, width: v.videoWidth, height: v.videoHeight,
+                    duration: v.duration, readyState: v.readyState,
                 }))""")
-            except Exception:
+            except Exception as e:
+                download_attempts[slot]["last_error"] = f"evaluate: {e}"
                 continue
             candidates = [u for u in urls if u["src"] and "tooltip" not in u["src"] and "nux" not in u["src"]
                           and (u["src"].startswith("http") or u["src"].startswith("blob:"))]
@@ -443,23 +586,38 @@ def _generate_parallel(ctx, pending) -> list[Path]:
             if not pool:
                 continue
             url = pool[0]["src"]
+            download_attempts[slot]["last_url"] = url
             # Quick ready-check via HEAD-like fetch
             try:
                 status = page.evaluate(f"""async () => {{
                     try {{ const r = await fetch({json.dumps(url)}, {{ headers: {{Range: 'bytes=0-1'}}, credentials: 'include' }}); return r.status; }}
-                    catch {{ return 0; }}
+                    catch (e) {{ return {{ error: String(e) }}; }}
                 }}""")
-            except Exception:
-                status = 0
-            if status not in (200, 206):
+            except Exception as e:
+                status = {"error": str(e)}
+            if isinstance(status, dict) and "error" in status:
+                # blob: URLs can't be HEAD-fetched but can be fully read in-page. Try download directly.
+                if not url.startswith("blob:"):
+                    download_attempts[slot]["last_error"] = f"head-fetch: {status['error']}"
+                    continue
+            elif status not in (200, 206):
                 continue
+            download_attempts[slot]["tries"] += 1
             try:
-                print(f"  [{idx}/5] ready ({status}) — downloading {out.name}", flush=True)
+                print(f"  [{idx}/5] ready ({status}) — downloading {out.name} (attempt {download_attempts[slot]['tries']})", flush=True)
                 _download(url, out, page=page)
+                # Sanity: the file must actually contain video bytes
+                if not out.exists() or out.stat().st_size < 10_000:
+                    raise RuntimeError(f"download produced {out.stat().st_size if out.exists() else 0} bytes — likely empty/HTML")
                 outputs[slot] = out
                 finished[slot] = True
             except Exception as e:
-                print(f"  [{idx}/5] download error: {e}", flush=True)
+                download_attempts[slot]["last_error"] = f"download: {e}"
+                print(f"  [{idx}/5] download error (try {download_attempts[slot]['tries']}): {e}", flush=True)
+                # Give up after 3 attempts to download this same URL — the URL may have expired
+                if download_attempts[slot]["tries"] >= 3:
+                    print(f"  [{idx}/5] ✗ giving up after 3 download attempts; will retry serially later", flush=True)
+                    finished[slot] = True  # mark "done with parallel attempt" so we move on
         time.sleep(3)
     # Close all tabs
     for p in pages:
@@ -467,10 +625,13 @@ def _generate_parallel(ctx, pending) -> list[Path]:
             p.close()
         except Exception:
             pass
-    if not all(finished):
-        unfinished = [pending[i][0] for i, f in enumerate(finished) if not f]
-        raise TimeoutError(f"Did not finish within {GEN_TIMEOUT_S}s: indices {unfinished}")
-    return [p for p in outputs if p is not None]
+    # Final per-slot report so caller can see what failed and why
+    for slot, (idx, s, _, _) in enumerate(pending):
+        if outputs[slot] is None:
+            why = setup_errors[slot] or download_attempts[slot].get("last_error") or "unknown"
+            print(f"  [{idx}/5] ✗ NOT captured in parallel pass — reason: {why}", flush=True)
+    # Return outputs (may contain None for failed slots) — caller decides retry strategy
+    return outputs  # type: ignore[return-value]
 
 
 def generate_all(scripts_json: Path, out_dir: Path, headless: bool = False,
@@ -492,16 +653,55 @@ def generate_all(scripts_json: Path, out_dir: Path, headless: bool = False,
         args=["--window-size=1280,500", "--window-position=0,0"],
     )
     outputs: list[Path] = []
+    quota_exhausted = False
     try:
         pending = _collect_pending(scripts, out_dir, only)
         if parallel and len(pending) > 1:
-            outputs = _generate_parallel(ctx, pending)
+            try:
+                parallel_out = _generate_parallel(ctx, pending)
+            except GrokQuotaExceeded as e:
+                print(f"⛔ {e}", flush=True)
+                quota_exhausted = True
+                parallel_out = [None] * len(pending)
+            # Fold completed paths into outputs; collect the failed slots for serial retry.
+            failed_pending = []
+            for slot, (idx, s, img, out) in enumerate(pending):
+                if parallel_out[slot] is not None:
+                    outputs.append(parallel_out[slot])
+                else:
+                    failed_pending.append((idx, s, img, out))
+            # Retry failed slots serially in a fresh tab — but ONLY if we
+            # haven't hit the quota. Retrying after a quota error is futile.
+            if failed_pending and not quota_exhausted:
+                print(f"⟳ retrying {len(failed_pending)} slot(s) serially: "
+                      f"{[i for i, *_ in failed_pending]}", flush=True)
+                page = ctx.new_page()
+                for idx, s, img, out in failed_pending:
+                    if quota_exhausted:
+                        print(f"  [{idx}/5] skipping serial retry — quota exhausted", flush=True)
+                        continue
+                    print(f"[{idx}/5] {s['object']} (serial retry)", flush=True)
+                    try:
+                        generate_one(page, img, _build_grok_prompt(s), out)
+                        outputs.append(out)
+                    except GrokQuotaExceeded as e:
+                        print(f"  ⛔ {e} — stopping further attempts.", flush=True)
+                        quota_exhausted = True
+                    except Exception as e:
+                        print(f"  [{idx}/5] ✗ serial retry also failed: {e}", flush=True)
         else:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             for idx, s, img, out in pending:
+                if quota_exhausted:
+                    print(f"  [{idx}/5] skipping — quota exhausted on earlier clip", flush=True)
+                    continue
                 print(f"[{idx}/5] {s['object']}", flush=True)
-                generate_one(page, img, s["hindi_script"], out)
-                outputs.append(out)
+                try:
+                    generate_one(page, img, _build_grok_prompt(s), out)
+                    outputs.append(out)
+                except GrokQuotaExceeded as e:
+                    print(f"  ⛔ {e}", flush=True)
+                    quota_exhausted = True
     finally:
         try:
             ctx.close()
@@ -511,6 +711,15 @@ def generate_all(scripts_json: Path, out_dir: Path, headless: bool = False,
             except Exception:
                 pass
             lock_file.close()
+    # If quota was hit and we couldn't produce ANY clips, raise so the
+    # orchestrator (pipeline.py) stops before merge/upload steps. The
+    # subprocess exit will be non-zero and the QUOTA_MARKER is in the logs
+    # so the webapp can render a clear, distinct error.
+    if quota_exhausted and not outputs:
+        raise GrokQuotaExceeded(
+            f"{QUOTA_MARKER}: Grok video generation quota exhausted — no clips produced. "
+            f"Wait for the quota to reset, then retry from the videos step."
+        )
     return outputs
 
 

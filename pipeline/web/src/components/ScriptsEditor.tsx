@@ -30,7 +30,7 @@ function StatusDot({
   );
 }
 
-function WordMeter({ count, max = 40 }: { count: number; max?: number }) {
+function WordMeter({ count, max = 48 }: { count: number; max?: number }) {
   const pct = Math.min(100, Math.round((count / max) * 100));
   const over = count > max;
   const warn = count > max - 5;
@@ -170,6 +170,53 @@ export function ScriptsEditor({
     }
   };
 
+  const regenScript = async (idx: number) => {
+    const key = `script-${idx}`;
+    if (dirty && !confirm('You have unsaved script edits. Regenerating slot #' + idx + ' will reload from disk and lose unsaved changes elsewhere. Continue?')) {
+      return;
+    }
+    const hint = window.prompt(
+      `Regenerate script #${idx} via Gemini.\n\nOptional: give a hint for the new direction (object idea, tone, angle) — or leave empty for a random new pick.`,
+      '',
+    );
+    if (hint === null) return;  // user cancelled
+    setBusy(b => ({ ...b, [key]: true }));
+    setError(null);
+    const timeoutId = window.setTimeout(() => {
+      setBusy(b => { const n = { ...b }; delete n[key]; return n; });
+    }, 120_000);
+    try {
+      await api.regenScript(runId, idx, hint.trim() || undefined);
+      // Poll the scripts.json for the new content. The aux subprocess writes
+      // it asynchronously. Compare object/hindi_script of slot to detect.
+      const before = data?.scripts[idx - 1];
+      const beforeKey = `${before?.object}|${before?.hindi_script}`;
+      const pollStart = Date.now();
+      const tick = async () => {
+        try {
+          const fresh = await api.getScripts(runId);
+          const after = fresh.scripts[idx - 1];
+          const afterKey = `${after.object}|${after.hindi_script}`;
+          if (afterKey !== beforeKey) {
+            setData(fresh);
+            setDirty(false);
+            window.clearTimeout(timeoutId);
+            setBusy(b => { const n = { ...b }; delete n[key]; return n; });
+            return;
+          }
+        } catch {}
+        if (Date.now() - pollStart < 110_000) {
+          window.setTimeout(tick, 1500);
+        }
+      };
+      window.setTimeout(tick, 1500);
+    } catch (e: any) {
+      setError(`script regen #${idx}: ${e.message}`);
+      window.clearTimeout(timeoutId);
+      setBusy(b => { const n = { ...b }; delete n[key]; return n; });
+    }
+  };
+
   // Clear per-row busy as soon as the corresponding artifact lands.
   // This is the source-of-truth that the underlying subprocess actually wrote a file.
   useEffect(() => {
@@ -290,7 +337,7 @@ export function ScriptsEditor({
         // Stays true until the actual file lands (see effect below).
         const imgBusy = !img && !!busy[`image-${idx}`];
         const vidBusy = !vid && !!busy[`video-${idx}`];
-        const scriptOk = s.hindi_script.trim().length > 0 && s.word_count <= 40;
+        const scriptOk = s.hindi_script.trim().length > 0 && s.word_count <= 48;
         return (
           <div
             key={i}
@@ -304,7 +351,7 @@ export function ScriptsEditor({
               <StatusDot
                 label="Script"
                 state={scriptOk ? 'ok' : 'pending'}
-                hint={`Script ${scriptOk ? 'ready' : 'incomplete'} (${s.word_count}/40 words)`}
+                hint={`Script ${scriptOk ? 'ready' : 'incomplete'} (${s.word_count}/48 words)`}
               />
               <StatusDot
                 label="Image"
@@ -328,18 +375,50 @@ export function ScriptsEditor({
                   placeholder="object name"
                 />
                 <WordMeter count={s.word_count} />
+                <button
+                  onClick={() => regenScript(idx)}
+                  disabled={!!busy[`script-${idx}`]}
+                  className="text-[10px] px-1.5 py-0.5 rounded border border-zinc-700 bg-zinc-800/70 text-zinc-300
+                             hover:bg-zinc-700 hover:border-zinc-600 transition
+                             disabled:opacity-50 disabled:cursor-not-allowed
+                             flex items-center gap-1"
+                  title={`Regenerate script #${idx} via Gemini (optional hint)`}
+                >
+                  <span className={busy[`script-${idx}`] ? 'inline-block animate-spin' : ''}>↻</span>
+                  <span>Script</span>
+                </button>
               </div>
               <div>
-                <div className="text-[10px] uppercase text-zinc-500 mb-0.5 tracking-wider">Hindi script</div>
+                <div className="text-[10px] uppercase text-zinc-500 mb-0.5 tracking-wider flex items-center gap-1.5">
+                  <span>Dialogue (Hindi script)</span>
+                  <span className="text-zinc-600 normal-case lowercase">— spoken in 10s</span>
+                </div>
                 <textarea
                   value={s.hindi_script}
                   onChange={e => update(i, { hindi_script: e.target.value })}
                   rows={4}
                   className="w-full bg-zinc-950 border border-zinc-800 rounded p-2 text-sm focus:border-emerald-500 focus:outline-none resize-y"
+                  placeholder="The Hindi/Hinglish dialogue the character speaks (≤48 words)"
                 />
               </div>
               <div>
-                <div className="text-[10px] uppercase text-zinc-500 mb-0.5 tracking-wider">Image prompt</div>
+                <div className="text-[10px] uppercase text-zinc-500 mb-0.5 tracking-wider flex items-center gap-1.5">
+                  <span>Action script</span>
+                  <span className="text-zinc-600 normal-case lowercase">— camera + motion (no word limit)</span>
+                </div>
+                <textarea
+                  value={s.action_script || ''}
+                  onChange={e => update(i, { action_script: e.target.value })}
+                  rows={4}
+                  className="w-full bg-zinc-950 border border-zinc-800 rounded p-2 text-xs focus:border-emerald-500 focus:outline-none resize-y"
+                  placeholder="Camera shot type, character gestures, scenery motion, background life, closing pose"
+                />
+              </div>
+              <div>
+                <div className="text-[10px] uppercase text-zinc-500 mb-0.5 tracking-wider flex items-center gap-1.5">
+                  <span>Image prompt</span>
+                  <span className="text-zinc-600 normal-case lowercase">— first-frame style (Pixar look)</span>
+                </div>
                 <textarea
                   value={s.image_prompt}
                   onChange={e => update(i, { image_prompt: e.target.value })}

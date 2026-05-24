@@ -9,28 +9,78 @@ interface Idea {
   source: 'seed' | 'generated' | 'manual';
 }
 
-const LS_KEY = 'objtalk_ideas_v1';
+// PERMANENT design: localStorage stores ONLY the user's deltas — never the
+// seed list itself. The seed list is always re-read from src/data/seedIdeas.ts
+// on each load. This means: edit seedIdeas.ts → reload → new list appears,
+// no key bumps, no cache clears, while still preserving the user's done marks,
+// dismissals, and custom-generated entries.
+//
+// Schema (objtalk_ideas_state_v1):
+//   done:    array of normalized texts the user has ticked
+//   removed: array of normalized texts the user has dismissed
+//   added:   array of {text, source} the user has added via "+10 ideas"
+const LS_KEY = 'objtalk_ideas_state_v1';
+const LEGACY_KEYS = ['objtalk_ideas_v1', 'objtalk_ideas_v2'];
 
-function loadIdeas(): Idea[] {
+interface PersistedState {
+  done: string[];
+  removed: string[];
+  added: { text: string; source: 'generated' | 'manual' }[];
+}
+
+const EMPTY_STATE: PersistedState = { done: [], removed: [], added: [] };
+
+function normalize(text: string): string {
+  return text.toLowerCase().trim().replace(/\s+/g, ' ');
+}
+
+function loadState(): PersistedState {
+  // Clean up any old whole-list caches first — they'd just sit there orphaned.
+  for (const k of LEGACY_KEYS) {
+    try { localStorage.removeItem(k); } catch {}
+  }
   try {
     const raw = localStorage.getItem(LS_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      if (parsed && typeof parsed === 'object') {
+        return {
+          done: Array.isArray(parsed.done) ? parsed.done : [],
+          removed: Array.isArray(parsed.removed) ? parsed.removed : [],
+          added: Array.isArray(parsed.added) ? parsed.added : [],
+        };
+      }
     }
   } catch {}
-  return SEED_IDEAS.map((text, i) => ({
-    id: `seed-${i}`,
-    text,
-    done: false,
-    source: 'seed' as const,
-  }));
+  return { ...EMPTY_STATE };
 }
 
-function saveIdeas(ideas: Idea[]) {
-  try {
-    localStorage.setItem(LS_KEY, JSON.stringify(ideas));
-  } catch {}
+function saveState(state: PersistedState) {
+  try { localStorage.setItem(LS_KEY, JSON.stringify(state)); } catch {}
+}
+
+// Build the visible Idea[] from SEED_IDEAS (source of truth) + persisted deltas.
+function buildIdeas(state: PersistedState): Idea[] {
+  const removed = new Set(state.removed.map(normalize));
+  const done = new Set(state.done.map(normalize));
+  const seedIdeas: Idea[] = SEED_IDEAS
+    .filter(text => !removed.has(normalize(text)))
+    .map((text, i) => ({
+      id: `seed-${i}`,
+      text,
+      done: done.has(normalize(text)),
+      source: 'seed' as const,
+    }));
+  const userIdeas: Idea[] = state.added
+    .filter(a => !removed.has(normalize(a.text)))
+    .map((a, i) => ({
+      id: `user-${i}-${normalize(a.text).slice(0, 30)}`,
+      text: a.text,
+      done: done.has(normalize(a.text)),
+      source: a.source,
+    }));
+  // User-added entries appear at the top so they're visible after generation.
+  return [...userIdeas, ...seedIdeas];
 }
 
 function slugify(text: string): string {
@@ -50,7 +100,7 @@ export function IdeasPanel({ onApply, completedSubjects }: {
   onApply: (subject: string) => void;
   completedSubjects: Set<string>;
 }) {
-  const [ideas, setIdeas] = useState<Idea[]>(() => loadIdeas());
+  const [state, setState] = useState<PersistedState>(() => loadState());
   const [filter, setFilter] = useState<'all' | 'todo' | 'done'>('todo');
   const [theme, setTheme] = useState('');
   const [generating, setGenerating] = useState(false);
@@ -58,24 +108,26 @@ export function IdeasPanel({ onApply, completedSubjects }: {
   const [flashId, setFlashId] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
+  // Derived view — SEED_IDEAS is source of truth, layered with persisted deltas.
+  const ideas = useMemo(() => buildIdeas(state), [state]);
+
   // Auto-mark ideas as done when a matching run exists in output/
   useEffect(() => {
     if (completedSubjects.size === 0) return;
-    setIdeas(prev => {
+    setState(prev => {
+      const doneSet = new Set(prev.done.map(normalize));
       let changed = false;
-      const next = prev.map(i => {
-        const isDone = completedSubjects.has(slugify(i.text));
-        if (isDone && !i.done) {
+      for (const idea of buildIdeas(prev)) {
+        if (completedSubjects.has(slugify(idea.text)) && !doneSet.has(normalize(idea.text))) {
+          doneSet.add(normalize(idea.text));
           changed = true;
-          return { ...i, done: true };
         }
-        return i;
-      });
-      return changed ? next : prev;
+      }
+      return changed ? { ...prev, done: Array.from(doneSet) } : prev;
     });
   }, [completedSubjects]);
 
-  useEffect(() => { saveIdeas(ideas); }, [ideas]);
+  useEffect(() => { saveState(state); }, [state]);
 
   const counts = useMemo(() => ({
     all: ideas.length,
@@ -89,12 +141,25 @@ export function IdeasPanel({ onApply, completedSubjects }: {
     return ideas;
   }, [ideas, filter]);
 
-  const toggle = (id: string) => {
-    setIdeas(prev => prev.map(i => (i.id === id ? { ...i, done: !i.done } : i)));
+  const toggleByText = (text: string) => {
+    setState(prev => {
+      const key = normalize(text);
+      const doneSet = new Set(prev.done.map(normalize));
+      if (doneSet.has(key)) doneSet.delete(key);
+      else doneSet.add(key);
+      return { ...prev, done: Array.from(doneSet) };
+    });
   };
 
-  const remove = (id: string) => {
-    setIdeas(prev => prev.filter(i => i.id !== id));
+  const removeByText = (text: string) => {
+    setState(prev => {
+      const key = normalize(text);
+      // For user-added entries: drop from `added` so they vanish cleanly.
+      const added = prev.added.filter(a => normalize(a.text) !== key);
+      // For seeds: mark as removed (a tombstone — won't reappear when SEED_IDEAS reloads).
+      const removed = Array.from(new Set([...prev.removed.map(normalize), key]));
+      return { ...prev, added, removed };
+    });
   };
 
   const handleApply = (idea: Idea) => {
@@ -113,16 +178,17 @@ export function IdeasPanel({ onApply, completedSubjects }: {
     setError(null);
     try {
       const { ideas: newOnes } = await api.generateIdeas(theme || undefined, 10);
-      const existing = new Set(ideas.map(i => i.text.toLowerCase()));
-      const fresh = newOnes
-        .filter(t => !existing.has(t.toLowerCase()))
-        .map((text, idx) => ({
-          id: `gen-${Date.now()}-${idx}`,
-          text,
-          done: false,
-          source: 'generated' as const,
-        }));
-      setIdeas(prev => [...fresh, ...prev]);
+      setState(prev => {
+        const existing = new Set([
+          ...SEED_IDEAS.map(normalize),
+          ...prev.added.map(a => normalize(a.text)),
+        ]);
+        const removedSet = new Set(prev.removed.map(normalize));
+        const fresh = newOnes
+          .filter(t => !existing.has(normalize(t)) && !removedSet.has(normalize(t)))
+          .map(text => ({ text, source: 'generated' as const }));
+        return { ...prev, added: [...fresh, ...prev.added] };
+      });
     } catch (e: any) {
       setError(e.message);
     } finally {
@@ -131,16 +197,8 @@ export function IdeasPanel({ onApply, completedSubjects }: {
   };
 
   const resetSeeds = () => {
-    if (!confirm('Reset list to the 50 seed ideas? (Keeps your done marks for matching texts.)')) return;
-    const doneTexts = new Set(ideas.filter(i => i.done).map(i => i.text.toLowerCase()));
-    setIdeas(
-      SEED_IDEAS.map((text, i) => ({
-        id: `seed-${i}`,
-        text,
-        done: doneTexts.has(text.toLowerCase()),
-        source: 'seed' as const,
-      })),
-    );
+    if (!confirm('Reset list to the seed ideas? Drops any generated/custom entries and un-dismisses removed seeds. Keeps your done marks.')) return;
+    setState(prev => ({ done: prev.done, removed: [], added: [] }));
   };
 
   const donePct = counts.all === 0 ? 0 : Math.round((counts.done / counts.all) * 100);
@@ -241,7 +299,7 @@ export function IdeasPanel({ onApply, completedSubjects }: {
                 }`}
               >
                 <button
-                  onClick={() => toggle(idea.id)}
+                  onClick={() => toggleByText(idea.text)}
                   aria-label={idea.done ? 'mark as not done' : 'mark as done'}
                   className={`shrink-0 w-4 h-4 rounded border-2 flex items-center justify-center transition ${
                     idea.done
@@ -280,7 +338,7 @@ export function IdeasPanel({ onApply, completedSubjects }: {
                   Apply ↑
                 </button>
                 <button
-                  onClick={() => remove(idea.id)}
+                  onClick={() => removeByText(idea.text)}
                   className="shrink-0 text-zinc-600 hover:text-red-400 text-xs px-1 opacity-0 group-hover:opacity-100"
                   title="Remove"
                   aria-label="Remove idea"
