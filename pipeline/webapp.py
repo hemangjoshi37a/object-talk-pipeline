@@ -30,7 +30,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -55,38 +55,102 @@ class RunBus:
     image/video regens all share one stream so the UI sees ALL of their logs.
     """
 
-    def __init__(self, run_id: str, loop: asyncio.AbstractEventLoop):
+    def __init__(self, run_id: str, loop: asyncio.AbstractEventLoop | None = None):
         self.run_id = run_id
+        # `loop` may be None when the bus is created from a sync context just
+        # to re-hydrate persisted events for a read-only API response. emit()
+        # binds the loop lazily on first call, when we're guaranteed to be in
+        # an async context (Job's background thread → bus.emit → run_coroutine).
         self.loop = loop
         self.events: list[dict] = []
-        self.log: list[str] = []
+        # Each log entry is {"ts": float, "text": str}. The frontend renders
+        # ts beside the line so users can correlate events with wall-clock.
+        self.log: list[dict] = []
+        # Reset epoch — bumped whenever events get wiped (e.g. retry start).
+        # In-flight SSE generators compare against this and break out when it
+        # changes, forcing the client to reconnect and resync from cursor 0.
+        self.reset_epoch: int = 0
         self.status = "idle"  # running | done | error | cancelled | idle
         self.current_step: str | None = None
         self.step_progress: dict | None = None
         self.youtube_url: str | None = None
         self.subject: str | None = None
-        # error_kind: a coarse category for the most recent failure so the UI
-        # can render a distinct banner. Set by _parse_line on specific markers.
-        #   "grok_quota"   — Grok rate-limited; user must wait + retry from videos
-        #   None           — no specific error, fall back to generic "error" status
         self.error_kind: str | None = None
-        self.error_message: str | None = None  # human-readable context line
+        self.error_message: str | None = None
         self.created_at = time.time()
         self.updated_at = self.created_at
         self.condition = asyncio.Condition()
         self._lock = threading.Lock()
-        self.active_jobs: int = 0  # how many Jobs currently feeding this bus
+        self.active_jobs: int = 0
+        # Persisted event log: every event appended to output/<id>/events.jsonl
+        # so logs survive backend restarts and pause/resume sessions. On bus
+        # creation we replay the file into memory so SSE replay still works.
+        self._events_path = OUTPUT_DIR / run_id / "events.jsonl"
+        self._events_fh = None  # lazily opened on first emit
+        self._load_persisted_events()
+
+    def _load_persisted_events(self) -> None:
+        """Re-hydrate `events` + `log` from disk so SSE replay works after restart."""
+        if not self._events_path.exists():
+            return
+        try:
+            with self._events_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except Exception:
+                        continue
+                    self.events.append(ev)
+                    if ev.get("kind") == "log":
+                        # Old events.jsonl lines may not have a ts — fall back
+                        # to the file's mtime so the UI still gets a rough
+                        # marker instead of "1970".
+                        self.log.append({
+                            "ts": ev.get("ts") or self._events_path.stat().st_mtime,
+                            "text": ev.get("payload", ""),
+                        })
+            # Cap in-memory log buffer; the file keeps the full history.
+            if len(self.log) > 2000:
+                self.log = self.log[-2000:]
+        except Exception:
+            pass
 
     def emit(self, kind: str, payload: Any) -> None:
-        event = {"kind": kind, "payload": payload}
+        # Every event carries the wall-clock timestamp the bus saw it. The
+        # frontend uses this to render relative times beside each log line.
+        event = {"kind": kind, "payload": payload, "ts": time.time()}
         with self._lock:
             self.events.append(event)
-            self.updated_at = time.time()
+            self.updated_at = event["ts"]
             if kind == "log":
-                self.log.append(payload)
+                # Store the log line as a [timestamp, text] tuple so the
+                # snapshot endpoint can hand timing back to the UI even
+                # without replaying the full event stream.
+                self.log.append({"ts": event["ts"], "text": payload})
                 if len(self.log) > 2000:
                     self.log = self.log[-2000:]
-        asyncio.run_coroutine_threadsafe(self._notify(), self.loop)
+            try:
+                self._events_path.parent.mkdir(parents=True, exist_ok=True)
+                if self._events_fh is None:
+                    self._events_fh = self._events_path.open("a", encoding="utf-8")
+                self._events_fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+                self._events_fh.flush()
+            except Exception:
+                pass
+        # Lazily bind to the running asyncio loop on first emit — buses
+        # created from a sync context (run_dict re-hydration) won't have one.
+        if self.loop is None:
+            try:
+                self.loop = asyncio.get_event_loop()
+            except RuntimeError:
+                return  # no loop available (sync context); skip notification
+        try:
+            asyncio.run_coroutine_threadsafe(self._notify(), self.loop)
+        except Exception:
+            pass
 
     async def _notify(self) -> None:
         async with self.condition:
@@ -99,7 +163,12 @@ BUSES: dict[str, RunBus] = {}
 def get_bus(run_id: str, subject: str | None = None) -> RunBus:
     bus = BUSES.get(run_id)
     if bus is None:
-        bus = RunBus(run_id, asyncio.get_running_loop())
+        # Try to grab the running loop; OK if absent — bus.emit() will rebind.
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        bus = RunBus(run_id, loop)
         BUSES[run_id] = bus
     if subject and not bus.subject:
         bus.subject = subject
@@ -119,12 +188,17 @@ class Job:
     """
 
     def __init__(self, run_id: str, cmd: list[str], *, primary: bool = True,
-                 label: str | None = None, subject: str | None = None):
+                 label: str | None = None, subject: str | None = None,
+                 extra_env: dict[str, str] | None = None):
         self.run_id = run_id
         self.cmd = cmd
         self.primary = primary
         self.label = label  # e.g. "regen-image-3", used to prefix log lines
         self.bus = get_bus(run_id, subject)
+        # extra_env overrides .env per-spawn — used for per-run choices like
+        # COMFYUI_ENGINE that shouldn't permanently mutate .env (which would
+        # leak the choice into subsequent runs).
+        self.extra_env = extra_env or {}
         self.proc: subprocess.Popen | None = None
         self.is_active = False
 
@@ -137,6 +211,22 @@ class Job:
         return self.bus.subject or self.run_id
 
     def start(self) -> None:
+        # Re-read .env at spawn time so Settings-page edits to API keys take
+        # effect for subprocesses without requiring a backend restart. The
+        # parent's os.environ may have stale values from when webapp.py first
+        # loaded; an on-disk .env edit by the Settings UI wouldn't propagate.
+        spawn_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+        env_file = ROOT / ".env"
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                s = line.strip()
+                if not s or s.startswith("#") or "=" not in s:
+                    continue
+                k, v = s.split("=", 1)
+                spawn_env[k.strip()] = v.strip()
+        # Per-run overrides win over .env (e.g. user picked Wan for this run only).
+        for k, v in self.extra_env.items():
+            spawn_env[k] = v
         self.proc = subprocess.Popen(
             self.cmd,
             cwd=str(ROOT),
@@ -144,7 +234,7 @@ class Job:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            env=spawn_env,
             start_new_session=True,
         )
         self.is_active = True
@@ -208,12 +298,24 @@ class Job:
             bus.youtube_url = m.group(1)
             bus.emit("youtube", bus.youtube_url)
             return
-        # Grok quota — set a distinct error_kind so the UI can show a clear,
-        # non-scary "Wait for quota reset" banner instead of a raw stack trace.
+        # Grok failures — set a distinct error_kind so the UI can show a
+        # clear, non-scary banner instead of a raw stack trace. The marker
+        # `GROK_QUOTA_EXCEEDED` is used for ALL server-side refusals
+        # (rate-limit, heavy-load, quota); we then sub-classify based on
+        # the actual server message embedded in the line so the banner
+        # copy can adapt.
+        lower = line.lower()
         if "GROK_QUOTA_EXCEEDED" in line:
-            bus.error_kind = "grok_quota"
+            if "heavy load" in lower:
+                bus.error_kind = "grok_overload"
+            elif "rate limit reached" in lower:
+                bus.error_kind = "grok_rate_limit"
+            elif "reached your limit" in lower or "quota" in lower:
+                bus.error_kind = "grok_quota"
+            else:
+                bus.error_kind = "grok_error"
             bus.error_message = line.strip()
-            bus.emit("error_kind", {"kind": "grok_quota", "message": line.strip()})
+            bus.emit("error_kind", {"kind": bus.error_kind, "message": line.strip()})
 
     def _artifact_scanner(self) -> None:
         last_snapshot: dict | None = None
@@ -285,6 +387,14 @@ def artifacts_for(run_id: str) -> dict:
 def run_dict(run_id: str) -> dict:
     bus = BUSES.get(run_id)
     d = OUTPUT_DIR / run_id
+    # If the run has a persisted event log but no live bus (e.g. backend just
+    # restarted, or user opened a finished run after a fresh boot), spin up a
+    # bus and re-hydrate from disk so the UI sees the full log timeline.
+    if bus is None and (d / "events.jsonl").exists():
+        try:
+            bus = get_bus(run_id)
+        except Exception:
+            bus = None
     scripts_path = d / "scripts.json"
     subject = run_id
     if scripts_path.exists():
@@ -311,11 +421,43 @@ def run_dict(run_id: str) -> dict:
     error_kind = bus.error_kind if bus else None
     error_message = bus.error_message if bus else None
     if status == "error" and error_kind is None and bus:
-        for line in reversed(bus.log[-200:]):
+        for entry in reversed(bus.log[-200:]):
+            line = entry["text"] if isinstance(entry, dict) else entry
             if "GROK_QUOTA_EXCEEDED" in line:
-                error_kind = "grok_quota"
+                low = line.lower()
+                if "heavy load" in low:
+                    error_kind = "grok_overload"
+                elif "rate limit reached" in low:
+                    error_kind = "grok_rate_limit"
+                elif "reached your limit" in low or "quota" in low:
+                    error_kind = "grok_quota"
+                else:
+                    error_kind = "grok_error"
                 error_message = line.strip()
                 break
+    # Per-run flags persisted to run_meta.json. Surfaced to the UI so the run
+    # page shows what settings were used (and lets the user edit them via
+    # PUT /api/runs/<id>/settings before hitting Retry).
+    meta_file = d / "run_meta.json"
+    meta: dict = {}
+    if meta_file.exists():
+        try:
+            meta = json.loads(meta_file.read_text())
+        except Exception:
+            meta = {}
+    settings = {
+        "video_provider": meta.get("video_provider") or None,
+        "comfyui_engine": meta.get("comfyui_engine") or None,
+        "skip_images": bool(meta.get("skip_images")),
+        "skip_upload": bool(meta.get("skip_upload")),
+        "headless": bool(meta.get("headless")),
+        "parallel": bool(meta.get("parallel")),
+        "privacy": meta.get("privacy") or "public",
+        "clip_count": int(meta.get("clip_count") or 5),
+        "clip_duration_s": int(meta.get("clip_duration_s") or 10),
+        "max_words": meta.get("max_words"),
+        "manual_mode": bool(meta.get("manual_mode")),
+    }
     return {
         "id": run_id,
         "subject": subject,
@@ -330,6 +472,12 @@ def run_dict(run_id: str) -> dict:
         "log_tail": (bus.log[-300:] if bus else []),
         "error_kind": error_kind,
         "error_message": error_message,
+        # legacy top-level fields kept for back-compat with existing UI code
+        "skip_images": settings["skip_images"],
+        "clip_count": settings["clip_count"],
+        "clip_duration_s": settings["clip_duration_s"],
+        # full settings object for the new UI panel
+        "settings": settings,
     }
 
 
@@ -351,6 +499,21 @@ class RunOptions(BaseModel):
     headless: bool = False
     skip_upload: bool = False
     parallel: bool = False
+    # Which backend renders the clips. Default falls through to env VIDEO_PROVIDER
+    # (settable from the Settings page), which itself defaults to "grok".
+    video_provider: str | None = None  # "grok" | "comfyui" | None (= use default)
+    # Which ComfyUI engine — only meaningful when video_provider="comfyui".
+    comfyui_engine: str | None = None  # "ltx" | "wan" | None
+    # When true, skip Gemini image generation entirely and run the video provider
+    # in text-only mode (character description folded into the prompt).
+    skip_images: bool = False
+    # Length controls — user-settable from the form. clip_count default 5, duration 10s.
+    clip_count: int = 5            # 1..20
+    clip_duration_s: int = 10      # 5..30
+    # Manual override for max Hindi words per script. None → backend computes
+    # from duration (duration_s * 3 - 5). When user enters a value in the form,
+    # it overrides the calculated default and Gemini is told to land at ≤ N.
+    max_words: int | None = None   # 4..120
 
 
 class RetryOptions(BaseModel):
@@ -358,6 +521,12 @@ class RetryOptions(BaseModel):
     privacy: str | None = None
     headless: bool | None = None
     skip_upload: bool | None = None
+    video_provider: str | None = None
+    comfyui_engine: str | None = None
+    skip_images: bool | None = None
+    clip_count: int | None = None
+    clip_duration_s: int | None = None
+    max_words: int | None = None
 
 
 # ---------- FastAPI ----------
@@ -403,9 +572,34 @@ def _build_cmd(opts: RunOptions, from_step: str | None = None) -> list[str]:
         cmd.append("--skip-upload")
     if opts.parallel:
         cmd.append("--parallel")
+    if opts.video_provider:
+        cmd += ["--video-provider", opts.video_provider]
+    if opts.skip_images:
+        cmd.append("--skip-images")
+    if opts.clip_count and opts.clip_count != 5:
+        cmd += ["--clip-count", str(opts.clip_count)]
+    if opts.clip_duration_s and opts.clip_duration_s != 10:
+        cmd += ["--clip-duration-s", str(opts.clip_duration_s)]
+    if opts.max_words:
+        cmd += ["--max-words", str(opts.max_words)]
     if from_step:
         cmd += ["--from-step", from_step]
     return cmd
+
+
+def _save_run_meta(run_id: str, **flags) -> None:
+    """Persist per-run flags (like skip_images) so the UI can reflect them later."""
+    d = OUTPUT_DIR / run_id
+    d.mkdir(parents=True, exist_ok=True)
+    meta_file = d / "run_meta.json"
+    existing: dict = {}
+    if meta_file.exists():
+        try:
+            existing = json.loads(meta_file.read_text())
+        except Exception:
+            pass
+    existing.update(flags)
+    meta_file.write_text(json.dumps(existing, indent=2))
 
 
 @app.post("/api/runs")
@@ -413,7 +607,23 @@ async def start_run(opts: RunOptions) -> dict:
     run_id = slug_of(opts.subject)
     if run_id in JOBS and JOBS[run_id].is_active:
         raise HTTPException(409, f"already running: {run_id}")
-    job = Job(run_id, _build_cmd(opts), primary=True, subject=opts.subject)
+    _save_run_meta(run_id,
+                   skip_images=opts.skip_images,
+                   video_provider=opts.video_provider or "",
+                   comfyui_engine=opts.comfyui_engine or "",
+                   clip_count=opts.clip_count,
+                   clip_duration_s=opts.clip_duration_s,
+                   max_words=opts.max_words,
+                   privacy=opts.privacy,
+                   headless=opts.headless,
+                   skip_upload=opts.skip_upload,
+                   parallel=opts.parallel)
+    extra_env: dict[str, str] = {}
+    if opts.comfyui_engine in ("ltx", "wan", "wan_s2v"):
+        extra_env["COMFYUI_ENGINE"] = opts.comfyui_engine
+        extra_env["COMFYUI_WORKFLOW"] = ""  # force engine default workflow
+    job = Job(run_id, _build_cmd(opts), primary=True, subject=opts.subject,
+              extra_env=extra_env)
     JOBS[run_id] = job
     job.start()
     return run_dict(run_id)
@@ -421,6 +631,11 @@ async def start_run(opts: RunOptions) -> dict:
 
 class ManualRunRequest(BaseModel):
     subject: str
+    skip_images: bool = False  # hide the images section in the run view + skip step 2
+    comfyui_engine: str | None = None  # "ltx" | "wan" — sticky for this run's regen buttons
+    clip_count: int = 5
+    clip_duration_s: int = 10
+    max_words: int | None = None  # manual override; None → backend default
 
 
 @app.post("/api/runs/manual")
@@ -432,8 +647,24 @@ async def start_manual_run(req: ManualRunRequest) -> dict:
         raise HTTPException(409, f"already running: {run_id}")
     d = OUTPUT_DIR / run_id
     d.mkdir(parents=True, exist_ok=True)
+    _save_run_meta(run_id,
+                   skip_images=req.skip_images,
+                   video_provider="",  # manual mode = user picks per-clip
+                   comfyui_engine=req.comfyui_engine or "",
+                   clip_count=req.clip_count,
+                   clip_duration_s=req.clip_duration_s,
+                   max_words=req.max_words,
+                   privacy="public",
+                   headless=False,
+                   skip_upload=False,
+                   parallel=False,
+                   manual_mode=True)
     cmd = [PYTHON, "-u", str(ROOT / "steps" / "generate_scripts.py"),
-           req.subject, "--out", str(d / "scripts.json")]
+           req.subject, "--out", str(d / "scripts.json"),
+           "--count", str(req.clip_count),
+           "--duration-s", str(req.clip_duration_s)]
+    if req.max_words:
+        cmd += ["--max-words", str(req.max_words)]
     _spawn_step_job(run_id, req.subject, cmd, step="scripts")
     return run_dict(run_id)
 
@@ -460,6 +691,19 @@ async def cancel_run(run_id: str) -> dict:
     for aux in AUX_JOBS.get(run_id, []):
         if aux.is_active:
             aux.cancel()
+    # ComfyUI may still be processing the prompt the pipeline submitted —
+    # killing the Python script doesn't interrupt the GPU job. Tell ComfyUI
+    # to stop the current run and clear its queue so the next retry starts clean.
+    env = _read_env_file()
+    comfy_url = env.get("COMFYUI_URL", "http://127.0.0.1:8188").rstrip("/")
+    import urllib.request as _ur
+    for path, body in [("/interrupt", b""), ("/queue", b'{"clear":true}')]:
+        try:
+            req = _ur.Request(f"{comfy_url}{path}", data=body,
+                              headers={"Content-Type": "application/json"})
+            _ur.urlopen(req, timeout=3).read()
+        except Exception:
+            pass  # best-effort; ComfyUI may be on a different host or unreachable
     return {"ok": True}
 
 
@@ -471,6 +715,72 @@ async def retry_run(run_id: str, opts: RetryOptions) -> dict:
     existing = JOBS.get(run_id)
     if existing and existing.is_active:
         raise HTTPException(409, "still running")
+
+    # Reset the in-memory + on-disk event log so each retry shows a fresh
+    # slate in the UI. Without this, the events.jsonl accumulates every
+    # prior attempt's setup banner + traceback, and the UI replays all of
+    # it on connect — the user perceives this as "logs keep duplicating".
+    events_path = d / "events.jsonl"
+    if events_path.exists():
+        events_path.unlink(missing_ok=True)
+    bus = BUSES.get(run_id)
+    if bus is not None:
+        with bus._lock:
+            bus.events.clear()
+            bus.log.clear()
+            if bus._events_fh is not None:
+                try: bus._events_fh.close()
+                except Exception: pass
+                bus._events_fh = None
+            bus.error_kind = None
+            bus.error_message = None
+            bus.reset_epoch += 1
+        # Wake any in-flight SSE generators so they re-check the epoch
+        # and break out — the client auto-reconnects from cursor 0.
+        if bus.loop is not None:
+            try:
+                asyncio.run_coroutine_threadsafe(bus._notify(), bus.loop)
+            except Exception:
+                pass
+
+    # When retrying from an earlier step, wipe artifacts of LATER steps so the
+    # rebuild starts truly fresh (otherwise pipeline.py sees existing img_*/vid_*
+    # and "skips" them, defeating the retry intent).
+    step_order = ["scripts", "images", "videos", "merge", "upload"]
+    try:
+        from_idx = step_order.index(opts.from_step)
+    except ValueError:
+        from_idx = 0
+    # Retry semantics: RESUME-friendly. Wipe only artifacts that are
+    # logically invalidated by re-running the chosen step, NOT artifacts
+    # produced by that step itself. The pipeline's "skip if exists" logic
+    # picks up where it left off (e.g. retry-from-videos with 2 vid_*.mp4
+    # already on disk → renders only the missing 3, not all 5).
+    DOWNSTREAM = ("merge.mp4", "metadata.json", "youtube_url.txt")
+    if from_idx <= step_order.index("scripts"):
+        # Scripts change ⇒ images and videos are stale, must regenerate.
+        for p in list(d.glob("img_*")) + list(d.glob("vid_*.mp4")):
+            p.unlink(missing_ok=True)
+        for name in DOWNSTREAM:
+            (d / name).unlink(missing_ok=True)
+    elif from_idx == step_order.index("images"):
+        # Images change ⇒ videos referencing them are stale.
+        for p in d.glob("vid_*.mp4"):
+            p.unlink(missing_ok=True)
+        for name in DOWNSTREAM:
+            (d / name).unlink(missing_ok=True)
+    elif from_idx == step_order.index("videos"):
+        # Keep already-rendered vid_*.mp4 so the videos step resumes from
+        # the first missing one. Only wipe downstream artifacts.
+        for name in DOWNSTREAM:
+            (d / name).unlink(missing_ok=True)
+    elif from_idx == step_order.index("merge"):
+        for name in DOWNSTREAM:
+            (d / name).unlink(missing_ok=True)
+    elif from_idx == step_order.index("upload"):
+        for name in ("metadata.json", "youtube_url.txt"):
+            (d / name).unlink(missing_ok=True)
+
     scripts_path = d / "scripts.json"
     subject = run_id
     if scripts_path.exists():
@@ -478,23 +788,106 @@ async def retry_run(run_id: str, opts: RetryOptions) -> dict:
             subject = json.loads(scripts_path.read_text()).get("subject", run_id)
         except Exception:
             pass
-    privacy = opts.privacy or "public"
-    headless = opts.headless if opts.headless is not None else False
-    skip_upload = opts.skip_upload if opts.skip_upload is not None else False
-    run_opts = RunOptions(subject=subject, privacy=privacy, headless=headless, skip_upload=skip_upload)
-    job = Job(run_id, _build_cmd(run_opts, from_step=opts.from_step), primary=True, subject=subject)
+    # Read the original run's saved settings from run_meta.json — these become
+    # the defaults for every setting NOT explicitly overridden in the retry
+    # request. Without this, retry silently falls back to .env defaults and the
+    # user's run silently switches provider/engine.
+    meta: dict = {}
+    meta_file = d / "run_meta.json"
+    if meta_file.exists():
+        try:
+            meta = json.loads(meta_file.read_text())
+        except Exception:
+            meta = {}
+
+    def _pick(req_val, meta_key, default):
+        """Override > meta > default."""
+        if req_val is not None:
+            return req_val
+        v = meta.get(meta_key)
+        return default if v is None or v == "" else v
+
+    privacy = _pick(opts.privacy, "privacy", "public")
+    headless = _pick(opts.headless, "headless", False)
+    skip_upload = _pick(opts.skip_upload, "skip_upload", False)
+    skip_images = _pick(opts.skip_images, "skip_images", False)
+    video_provider = _pick(opts.video_provider, "video_provider", None) or None
+    comfyui_engine = _pick(opts.comfyui_engine, "comfyui_engine", None) or None
+    clip_count = int(_pick(opts.clip_count, "clip_count", 5))
+    clip_duration_s = int(_pick(opts.clip_duration_s, "clip_duration_s", 10))
+    max_words = opts.max_words if opts.max_words is not None else meta.get("max_words")
+    run_opts = RunOptions(subject=subject, privacy=privacy, headless=headless, skip_upload=skip_upload,
+                          video_provider=video_provider, skip_images=skip_images,
+                          comfyui_engine=comfyui_engine,
+                          clip_count=clip_count, clip_duration_s=clip_duration_s,
+                          max_words=max_words)
+    # Persist the resolved settings back to meta so subsequent retries see them
+    # (e.g. user overrides provider on a retry → that becomes the new default).
+    _save_run_meta(run_id,
+                   skip_images=skip_images,
+                   video_provider=video_provider or "",
+                   comfyui_engine=comfyui_engine or "",
+                   clip_count=clip_count,
+                   clip_duration_s=clip_duration_s,
+                   max_words=max_words,
+                   privacy=privacy,
+                   headless=headless,
+                   skip_upload=skip_upload)
+    # Build extra_env so the per-run engine choice wins over .env (same as start_run).
+    extra_env: dict[str, str] = {}
+    if comfyui_engine in ("ltx", "wan", "wan_s2v"):
+        extra_env["COMFYUI_ENGINE"] = comfyui_engine
+        extra_env["COMFYUI_WORKFLOW"] = ""  # force engine default workflow
+    job = Job(run_id, _build_cmd(run_opts, from_step=opts.from_step), primary=True, subject=subject,
+              extra_env=extra_env)
     JOBS[run_id] = job
     job.start()
     return run_dict(run_id)
 
 
+class SettingsPatch(BaseModel):
+    """Partial settings update for a run — every field optional. Only changes
+    `run_meta.json`; does NOT trigger a re-run. Hit Retry afterwards if you
+    want the new settings to take effect."""
+    privacy: str | None = None
+    headless: bool | None = None
+    skip_upload: bool | None = None
+    parallel: bool | None = None
+    video_provider: str | None = None
+    comfyui_engine: str | None = None
+    skip_images: bool | None = None
+    clip_count: int | None = None
+    clip_duration_s: int | None = None
+    max_words: int | None = None
+
+
+@app.put("/api/runs/{run_id}/settings")
+async def update_run_settings(run_id: str, patch: SettingsPatch) -> dict:
+    """Edit per-run settings after the fact. The next Retry will pick them up."""
+    d = OUTPUT_DIR / run_id
+    if not d.exists():
+        raise HTTPException(404, "no such run")
+    updates: dict = {}
+    for field in ("privacy", "headless", "skip_upload", "parallel",
+                  "video_provider", "comfyui_engine", "skip_images",
+                  "clip_count", "clip_duration_s", "max_words"):
+        v = getattr(patch, field, None)
+        if v is not None:
+            # Normalize empty strings to "" (stored) so retry treats them as unset.
+            updates[field] = v
+    if updates:
+        _save_run_meta(run_id, **updates)
+    return run_dict(run_id)
+
+
 def _spawn_step_job(run_id: str, subject: str, cmd: list[str],
-                    step: str | None = None) -> Job:
+                    step: str | None = None,
+                    extra_env: dict[str, str] | None = None) -> Job:
     """Start a primary subprocess (manual scripts gen, video regen, merge, upload).
     Only one primary job per run_id at a time (Chrome lock + status conflicts)."""
     if run_id in JOBS and JOBS[run_id].is_active:
         raise HTTPException(409, "another job already running for this run")
-    job = Job(run_id, cmd, primary=True, subject=subject)
+    job = Job(run_id, cmd, primary=True, subject=subject, extra_env=extra_env)
     JOBS[run_id] = job
     job.start()
     if step:
@@ -564,21 +957,55 @@ async def regen_image(run_id: str, idx: int) -> dict:
     return run_dict(run_id)
 
 
+class RegenVideoOpts(BaseModel):
+    video_provider: str | None = None  # "grok" | "comfyui" | None (= use env default)
+    comfyui_engine: str | None = None  # "ltx" | "wan" — only relevant when provider=comfyui
+
+
 @app.post("/api/runs/{run_id}/regen/video/{idx}")
-async def regen_video(run_id: str, idx: int) -> dict:
+async def regen_video(run_id: str, idx: int, opts: RegenVideoOpts | None = None) -> dict:
     if idx < 1 or idx > 5:
         raise HTTPException(400, "idx must be 1..5")
     d = OUTPUT_DIR / run_id
     if not (d / "scripts.json").exists():
         raise HTTPException(404, "no scripts.json")
-    if not list(d.glob(f"img_{idx:02d}_*")):
+    # Read the run's saved settings so the per-run choices stick — request body
+    # overrides everything, then run_meta, then env default. Without this, hitting
+    # "Generate" on a clip silently fell back to .env's VIDEO_PROVIDER (often
+    # `comfyui`) and ignored the user's per-run Grok selection.
+    meta_file = d / "run_meta.json"
+    meta: dict = {}
+    if meta_file.exists():
+        try:
+            meta = json.loads(meta_file.read_text())
+        except Exception:
+            pass
+    run_skip_images = bool(meta.get("skip_images"))
+    provider = ((opts.video_provider if opts else None)
+                or (meta.get("video_provider") or None)
+                or os.environ.get("VIDEO_PROVIDER", "grok"))
+    # Grok needs the per-script image as the first frame (unless skip_images);
+    # ComfyUI is fine without one.
+    if provider == "grok" and not run_skip_images and not list(d.glob(f"img_{idx:02d}_*")):
         raise HTTPException(400, f"no image for index {idx} — generate the image first")
-    # Delete the existing video so generate_videos.py doesn't skip it
+    # Delete the existing video so the generator doesn't skip it
     for existing in d.glob(f"vid_{idx:02d}_*.mp4"):
         existing.unlink()
-    cmd = [PYTHON, "-u", str(ROOT / "steps" / "generate_videos.py"),
+    step_script = "generate_videos_comfyui.py" if provider == "comfyui" else "generate_videos.py"
+    cmd = [PYTHON, "-u", str(ROOT / "steps" / step_script),
            str(d), "--only", str(idx)]
-    _spawn_step_job(run_id, _subject_for(run_id), cmd, step="videos")
+    # Build per-spawn env overrides (skip_images + engine choice)
+    extra_env: dict[str, str] = {}
+    if run_skip_images:
+        extra_env["SKIP_IMAGES"] = "1"
+    engine = ((opts.comfyui_engine if opts else None)
+              or (meta.get("comfyui_engine") or None)
+              or os.environ.get("COMFYUI_ENGINE", "ltx"))
+    if engine in ("ltx", "wan", "wan_s2v"):
+        extra_env["COMFYUI_ENGINE"] = engine
+        extra_env["COMFYUI_WORKFLOW"] = ""  # force engine default workflow
+    _spawn_step_job(run_id, _subject_for(run_id), cmd, step="videos",
+                    extra_env=extra_env)
     return run_dict(run_id)
 
 
@@ -660,7 +1087,12 @@ async def delete_run(run_id: str) -> dict:
             aux.cancel()
     JOBS.pop(run_id, None)
     AUX_JOBS.pop(run_id, None)
-    BUSES.pop(run_id, None)
+    bus = BUSES.pop(run_id, None)
+    if bus and bus._events_fh:
+        try:
+            bus._events_fh.close()
+        except Exception:
+            pass
     d = OUTPUT_DIR / run_id
     if d.exists():
         shutil.rmtree(d)
@@ -670,21 +1102,41 @@ async def delete_run(run_id: str) -> dict:
 @app.get("/api/runs/{run_id}/events")
 async def stream_events(run_id: str, request: Request):
     bus = BUSES.get(run_id)
+    # Resume cursor: client can pass ?cursor=N to skip events it's already seen.
+    # Falls back to SSE Last-Event-ID header (auto-set by browser on reconnect).
+    try:
+        cursor_param = int(request.query_params.get("cursor", "") or
+                           request.headers.get("last-event-id", "") or "0")
+    except (TypeError, ValueError):
+        cursor_param = 0
 
     async def gen():
-        cursor = 0
+        cursor = cursor_param
         if bus:
+            # Capture the bus's reset epoch at connect time. If retry_run
+            # wipes the bus mid-stream, the epoch bumps and this generator
+            # breaks out, forcing the client to reconnect from cursor 0.
+            my_epoch = bus.reset_epoch
+            # If the client's resume cursor (from Last-Event-ID) is past the
+            # current buffer length — usually because the bus was wiped on
+            # retry — rewind to 0 so we send the fresh events from the start.
+            if cursor > len(bus.events):
+                cursor = 0
             # Replay everything in the bus so far
             while cursor < len(bus.events):
-                yield f"data: {json.dumps(bus.events[cursor])}\n\n"
+                yield f"id: {cursor}\ndata: {json.dumps(bus.events[cursor])}\n\n"
                 cursor += 1
             # Then stream new events; stay open as long as any job is feeding
             while True:
                 if await request.is_disconnected():
                     break
+                # Bus was reset (retry started). Close so the client
+                # reconnects with a fresh cursor.
+                if bus.reset_epoch != my_epoch:
+                    break
                 if cursor < len(bus.events):
                     while cursor < len(bus.events):
-                        yield f"data: {json.dumps(bus.events[cursor])}\n\n"
+                        yield f"id: {cursor}\ndata: {json.dumps(bus.events[cursor])}\n\n"
                         cursor += 1
                     continue
                 # No new events and no active jobs → close gracefully
@@ -763,6 +1215,115 @@ def _mask_secret(v: str) -> str:
     return v[:4] + "•" * (len(v) - 8) + v[-4:]
 
 
+def _grok_profile_status(profile_dir: Path) -> dict:
+    """Inspect the Chromium profile dir Grok uses. Reads cookie names directly
+    from the cookies sqlite DB (no browser launch needed) to classify the
+    profile as:
+      - "missing"        — directory empty / no Cookies DB
+      - "anonymous"      — Cookies DB present but only anon cookies
+                           (x-anonuserid, cf_clearance, etc.) — Grok will let
+                           you submit prompts but the share URLs 403 on download
+      - "authenticated"  — at least one session/auth cookie present
+    """
+    import sqlite3
+    status = {
+        "profile_path": str(profile_dir),
+        "state": "missing",
+        "logged_in": False,
+        "cookies_count": 0,
+        "host_count": 0,
+        "session_cookies": [],
+        "profile_age_s": None,
+        "cookies_age_s": None,
+    }
+    if not profile_dir.exists():
+        return status
+    status["profile_age_s"] = int(time.time() - profile_dir.stat().st_mtime)
+    cookies_db = profile_dir / "Default" / "Cookies"
+    if not cookies_db.exists() or cookies_db.stat().st_size < 100:
+        return status
+    status["cookies_age_s"] = int(time.time() - cookies_db.stat().st_mtime)
+    # Open RO so we don't conflict with a live Chromium process.
+    try:
+        conn = sqlite3.connect(f"file:{cookies_db}?mode=ro", uri=True, timeout=2)
+        rows = list(conn.execute(
+            "SELECT host_key, name FROM cookies "
+            "WHERE host_key LIKE '%grok%' OR host_key LIKE '%x.ai%' OR host_key LIKE '%x.com%'"
+        ))
+        conn.close()
+    except Exception:
+        return status
+    status["cookies_count"] = len(rows)
+    status["host_count"] = len({h for h, _ in rows})
+    # Real Grok/X session cookies — exact names, not substrings (substring
+    # matching gave false positives on __stripe_sid, x-anonuserid, etc).
+    AUTH_NAMES = {
+        "sso", "auth_token", "auth-token", "next-auth.session-token",
+        "__Secure-next-auth.session-token", "_grok_session",
+        "twid", "ct0", "kdt",  # X.com login cookies (X uses the same SSO)
+        "x-user-id",
+    }
+    # Names we KNOW are not auth, so don't get confused if they appear.
+    NON_AUTH_PREFIXES = ("__stripe", "__cf", "mp_", "OptanonConsent",
+                          "i18nextLng", "grok_device_id", "x-anonuserid",
+                          "x-challenge", "x-signature")
+    session_names = []
+    has_anon = False
+    for _, name in rows:
+        if name.startswith(NON_AUTH_PREFIXES):
+            if name == "x-anonuserid":
+                has_anon = True
+            continue
+        if name in AUTH_NAMES:
+            session_names.append(name)
+    status["session_cookies"] = session_names
+    if session_names:
+        status["state"] = "authenticated"
+        status["logged_in"] = True
+    elif has_anon or rows:
+        status["state"] = "anonymous"
+    return status
+
+
+def _comfyui_health(url: str, timeout: float = 2.5) -> dict:
+    """Best-effort ping of ComfyUI at the configured URL — used by Settings UI."""
+    import urllib.request as _ur
+    try:
+        with _ur.urlopen(f"{url.rstrip('/')}/system_stats", timeout=timeout) as r:
+            data = json.loads(r.read())
+        return {
+            "reachable": True,
+            "version": data.get("system", {}).get("comfyui_version"),
+        }
+    except Exception as e:
+        return {"reachable": False, "error": str(e)[:140]}
+
+
+def _comfyui_list_workflows(url: str, timeout: float = 2.5) -> list[str]:
+    """Pull the saved-workflow list from ComfyUI userdata."""
+    import urllib.request as _ur
+    try:
+        with _ur.urlopen(f"{url.rstrip('/')}/userdata?dir=workflows", timeout=timeout) as r:
+            data = json.loads(r.read())
+        # Strip .json suffix so the dropdown shows the slug used in the dropdown
+        return sorted(f[:-5] if f.endswith(".json") else f for f in data)
+    except Exception:
+        return []
+
+
+def _comfyui_list_loras(url: str, timeout: float = 3.0) -> list[str]:
+    """Pull the list of LoRA filenames the ComfyUI host can see (LoraLoaderModelOnly)."""
+    import urllib.request as _ur
+    try:
+        with _ur.urlopen(f"{url.rstrip('/')}/object_info/LoraLoaderModelOnly", timeout=timeout) as r:
+            data = json.loads(r.read())
+        files = data.get("LoraLoaderModelOnly", {}).get("input", {}).get("required", {}).get("lora_name", [])
+        # files[0] is the list of names when it's a combo input
+        return sorted(files[0]) if files and isinstance(files[0], list) else []
+    except Exception:
+        return []
+
+
 @app.get("/api/settings")
 def get_settings() -> dict:
     env = _read_env_file()
@@ -770,6 +1331,9 @@ def get_settings() -> dict:
     youtube_token = DEFAULT_YOUTUBE_TOKEN
     client_secret = DEFAULT_CLIENT_SECRET
     grok_profile = Path(env.get("GROK_PROFILE_DIR", str(ROOT / "browser_data" / "grok")))
+    comfy_url = env.get("COMFYUI_URL", "http://127.0.0.1:8188")
+    comfy_workflow = env.get("COMFYUI_WORKFLOW", "ltx23_nerdy_rodent")
+    comfy_health = _comfyui_health(comfy_url)
     return {
         "gemini": {
             "api_key_set": bool(gem),
@@ -784,12 +1348,90 @@ def get_settings() -> dict:
             "token_path": str(youtube_token),
             "token_age_s": int(time.time() - youtube_token.stat().st_mtime) if youtube_token.exists() else None,
         },
-        "grok": {
-            "profile_set": grok_profile.exists() and any(grok_profile.iterdir()) if grok_profile.is_dir() else False,
-            "profile_path": str(grok_profile),
-            "profile_age_s": int(time.time() - grok_profile.stat().st_mtime) if grok_profile.exists() else None,
+        "grok": _grok_profile_status(grok_profile),
+        "comfyui": {
+            "url": comfy_url,
+            "workflow": comfy_workflow,
+            "reachable": comfy_health.get("reachable", False),
+            "version": comfy_health.get("version"),
+            "health_error": comfy_health.get("error"),
+            "available_workflows": _comfyui_list_workflows(comfy_url) if comfy_health.get("reachable") else [],
+            "available_loras": _comfyui_list_loras(comfy_url) if comfy_health.get("reachable") else [],
+            "vbvr_lora": env.get("COMFYUI_VBVR_LORA", "VBVR-official-comfyui.safetensors"),
+            "vbvr_strength": float(env.get("COMFYUI_VBVR_STRENGTH", "0.7")),
+            "i2v_strength": float(env.get("COMFYUI_I2V_STRENGTH", "0.7")),
+            "engine": env.get("COMFYUI_ENGINE", "ltx"),
         },
+        "video_provider": env.get("VIDEO_PROVIDER", "grok"),
     }
+
+
+class ComfyUISettingsBody(BaseModel):
+    url: str | None = None
+    workflow: str | None = None
+    video_provider: str | None = None  # "grok" | "comfyui" — the default provider for new runs
+    engine: str | None = None          # "ltx" | "wan" — default ComfyUI engine
+    vbvr_lora: str | None = None       # filename of the VBVR LoRA (or "" to disable)
+    vbvr_strength: float | None = None # 0.0 to 2.0 (LoRA strength typical range)
+    i2v_strength: float | None = None  # 0.0 to 1.0
+
+
+@app.get("/api/settings/comfyui/workflow")
+def download_comfyui_workflow() -> Response:
+    """Stream the configured workflow JSON from ComfyUI's userdata so users can
+    download it from the Settings UI (and re-upload into another ComfyUI host).
+    """
+    env = _read_env_file()
+    url = env.get("COMFYUI_URL", "http://127.0.0.1:8188").rstrip("/")
+    wf = env.get("COMFYUI_WORKFLOW", "ltx23_nerdy_rodent")
+    import urllib.request as _ur, urllib.parse as _up
+    try:
+        with _ur.urlopen(f"{url}/userdata/workflows%2F{_up.quote(wf + '.json', safe='')}",
+                         timeout=10) as r:
+            body = r.read()
+    except Exception as e:
+        raise HTTPException(502, f"Could not fetch workflow from ComfyUI ({url}): {e}")
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{wf}.json"'},
+    )
+
+
+@app.put("/api/settings/comfyui")
+def put_comfyui_settings(body: ComfyUISettingsBody) -> dict:
+    env = _read_env_file()
+    if body.url is not None and body.url.strip():
+        env["COMFYUI_URL"] = body.url.strip().rstrip("/")
+        os.environ["COMFYUI_URL"] = env["COMFYUI_URL"]
+    if body.workflow is not None and body.workflow.strip():
+        env["COMFYUI_WORKFLOW"] = body.workflow.strip()
+        os.environ["COMFYUI_WORKFLOW"] = env["COMFYUI_WORKFLOW"]
+    if body.video_provider is not None:
+        if body.video_provider not in ("grok", "comfyui"):
+            raise HTTPException(400, "video_provider must be 'grok' or 'comfyui'")
+        env["VIDEO_PROVIDER"] = body.video_provider
+        os.environ["VIDEO_PROVIDER"] = body.video_provider
+    if body.engine is not None:
+        if body.engine not in ("ltx", "wan"):
+            raise HTTPException(400, "engine must be 'ltx' or 'wan'")
+        env["COMFYUI_ENGINE"] = body.engine
+        os.environ["COMFYUI_ENGINE"] = body.engine
+    if body.vbvr_lora is not None:
+        env["COMFYUI_VBVR_LORA"] = body.vbvr_lora.strip()
+        os.environ["COMFYUI_VBVR_LORA"] = env["COMFYUI_VBVR_LORA"]
+    if body.vbvr_strength is not None:
+        if not 0.0 <= body.vbvr_strength <= 2.0:
+            raise HTTPException(400, "vbvr_strength must be between 0.0 and 2.0")
+        env["COMFYUI_VBVR_STRENGTH"] = str(body.vbvr_strength)
+        os.environ["COMFYUI_VBVR_STRENGTH"] = env["COMFYUI_VBVR_STRENGTH"]
+    if body.i2v_strength is not None:
+        if not 0.0 <= body.i2v_strength <= 1.0:
+            raise HTTPException(400, "i2v_strength must be between 0.0 and 1.0")
+        env["COMFYUI_I2V_STRENGTH"] = str(body.i2v_strength)
+        os.environ["COMFYUI_I2V_STRENGTH"] = env["COMFYUI_I2V_STRENGTH"]
+    _write_env_file(env)
+    return get_settings()
 
 
 class GeminiSettingsBody(BaseModel):
@@ -869,6 +1511,183 @@ def delete_youtube_token() -> dict:
     if DEFAULT_YOUTUBE_TOKEN.exists():
         DEFAULT_YOUTUBE_TOKEN.unlink()
     return get_settings()
+
+
+def _grok_profile_dir() -> Path:
+    env = _read_env_file()
+    return Path(env.get("GROK_PROFILE_DIR", str(ROOT / "browser_data" / "grok")))
+
+
+@app.get("/api/settings/grok/profile")
+def get_grok_profile() -> dict:
+    """Inspect-only — same data Settings shows, useful for polling after login."""
+    return _grok_profile_status(_grok_profile_dir())
+
+
+@app.delete("/api/settings/grok/profile")
+def grok_logout() -> dict:
+    """Wipe the Grok browser profile (logout). The next launch will be anonymous,
+    forcing the user through login again."""
+    p = _grok_profile_dir()
+    if p.exists():
+        # Refuse if another process has the profile locked — Chromium leaves
+        # SingletonLock when running and clobbering it would corrupt state.
+        try:
+            shutil.rmtree(p)
+        except OSError as e:
+            raise HTTPException(409, f"can't remove profile (browser still running?): {e}")
+    return _grok_profile_status(p)
+
+
+class GrokCookiesPaste(BaseModel):
+    """Cookie blob exported from a logged-in browser. Accepts any of the common
+    extension export formats — Cookie-Editor (chrome), EditThisCookie (chrome),
+    or a raw Playwright/Puppeteer storage_state. Each cookie object should at
+    minimum have `name`, `value`, `domain`."""
+    cookies: list[dict]
+
+
+class GrokLoginRequest(BaseModel):
+    timeout_s: int = 600  # how long to keep the headed browser open
+
+
+@app.post("/api/settings/grok/login")
+async def grok_login(req: GrokLoginRequest) -> dict:
+    """Spawn a headed Chromium pointing at the Grok profile + grok.com so the
+    user can log in. The browser stays open until they close it OR the timeout
+    fires. We can't pop a window over SSH — if there's no DISPLAY/WAYLAND
+    available, return instructions instead of failing silently.
+    """
+    display = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    if not display:
+        raise HTTPException(400,
+            "No DISPLAY/WAYLAND_DISPLAY in the backend's environment. The "
+            "Grok login flow needs a real X server (or ssh -X). Options:\n"
+            "  1. Re-start the backend from a desktop terminal: "
+            "DISPLAY=:0 ./run.sh\n"
+            "  2. SSH in with X-forwarding: ssh -X user@host then ./run.sh\n"
+            "  3. Use a separate machine to log in, then copy "
+            "browser_data/grok/ to this host."
+        )
+    p = _grok_profile_dir()
+    p.mkdir(parents=True, exist_ok=True)
+    # Spawn the cloakbrowser context in a background thread; the page stays
+    # open until the user closes it OR timeout fires. We don't await — return
+    # immediately so the UI can show "browser launching…".
+    import threading
+    def _runner() -> None:
+        try:
+            import cloakbrowser
+            ctx = cloakbrowser.launch_persistent_context(
+                user_data_dir=str(p),
+                headless=False,
+                viewport={"width": 1280, "height": 800},
+                args=["--window-size=1280,800"],
+            )
+            try:
+                page = ctx.new_page()
+                page.goto("https://grok.com/", wait_until="domcontentloaded", timeout=30000)
+                # Stay open — user does the login, we wait for them to close the tab.
+                deadline = time.time() + req.timeout_s
+                while time.time() < deadline:
+                    if not ctx.pages:
+                        break
+                    time.sleep(2)
+            finally:
+                try: ctx.close()
+                except Exception: pass
+        except Exception as e:
+            print(f"[grok-login] failed: {e}", flush=True)
+    threading.Thread(target=_runner, daemon=True).start()
+    return {"ok": True, "message": "Browser launching — complete the Grok login, then close the window."}
+
+
+def _normalize_cookie(c: dict) -> dict | None:
+    """Coerce one cookie object from any common export format into Playwright's
+    add_cookies() shape. Returns None on malformed input.
+
+    Supported sources (field aliases handled here):
+      - Cookie-Editor (Chrome ext)          → {expirationDate, hostOnly, sameSite: "no_restriction"}
+      - EditThisCookie (Chrome ext)          → similar, sameSite numeric
+      - Playwright/Puppeteer storage_state  → already in target format
+      - Curl / DevTools "Copy as cURL"      → typically only name+value+domain
+    """
+    name = c.get("name")
+    value = c.get("value")
+    domain = c.get("domain") or c.get("host")
+    if not name or value is None or not domain:
+        return None
+    out: dict = {
+        "name": str(name),
+        "value": str(value),
+        "domain": str(domain),
+        "path": c.get("path") or "/",
+    }
+    # Expiry: prefer numeric "expires" / "expirationDate"; ignore "session" cookies.
+    exp = c.get("expires") or c.get("expirationDate")
+    if isinstance(exp, (int, float)) and exp > 0:
+        out["expires"] = float(exp)
+    # Booleans
+    if c.get("httpOnly") is not None: out["httpOnly"] = bool(c["httpOnly"])
+    if c.get("secure") is not None:   out["secure"]   = bool(c["secure"])
+    # SameSite normalization — Playwright accepts "Strict"/"Lax"/"None"
+    ss = c.get("sameSite")
+    if isinstance(ss, str):
+        s = ss.lower().replace("_", "")
+        if s in ("strict",):              out["sameSite"] = "Strict"
+        elif s in ("lax",):               out["sameSite"] = "Lax"
+        elif s in ("none", "norestriction", "unspecified"): out["sameSite"] = "None"
+    elif isinstance(ss, (int, float)):
+        # EditThisCookie maps 0=None, 1=Lax, 2=Strict
+        out["sameSite"] = {0: "None", 1: "Lax", 2: "Strict"}.get(int(ss), "Lax")
+    return out
+
+
+@app.post("/api/settings/grok/cookies")
+def grok_import_cookies(req: GrokCookiesPaste) -> dict:
+    """Import a cookies blob exported from a logged-in browser elsewhere. Runs
+    headless Playwright so it works WITHOUT a display. After import, the
+    profile shows as `authenticated` if the blob contained Grok/X session
+    cookies.
+
+    How users get the blob (any one works):
+      - Cookie-Editor extension → "Export" → "Export as JSON" while on grok.com
+      - EditThisCookie → "Export"
+      - DevTools Application → Cookies → right-click → Copy all (paste as JSON)
+    """
+    cookies = [_normalize_cookie(c) for c in req.cookies]
+    cookies = [c for c in cookies if c]
+    if not cookies:
+        raise HTTPException(400, "No valid cookies in payload (need name/value/domain)")
+    # Only keep cookies for Grok / X domains — guards against accidentally
+    # pasting a dump from another site.
+    relevant = [c for c in cookies
+                if any(d in c["domain"] for d in ("grok.com", "x.ai", "x.com"))]
+    if not relevant:
+        raise HTTPException(400,
+            f"None of the {len(cookies)} cookies are for grok.com / x.ai / x.com — "
+            "did you export from the wrong tab?")
+    p = _grok_profile_dir()
+    p.mkdir(parents=True, exist_ok=True)
+    try:
+        import cloakbrowser
+        ctx = cloakbrowser.launch_persistent_context(
+            user_data_dir=str(p), headless=True,
+            viewport={"width": 1280, "height": 720},
+        )
+        try:
+            ctx.add_cookies(relevant)
+        finally:
+            ctx.close()
+    except Exception as e:
+        raise HTTPException(500, f"Failed to write cookies into profile: {e}")
+    status = _grok_profile_status(p)
+    return {
+        "ok": True,
+        "imported": len(relevant),
+        "ignored": len(cookies) - len(relevant),
+        "status": status,
+    }
 
 
 class TrendingRequest(BaseModel):

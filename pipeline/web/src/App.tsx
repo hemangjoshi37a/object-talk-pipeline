@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, type Run, type SseEvent } from './api';
+import { api, type Run, type SseEvent, type LogLine } from './api';
 import { Sidebar } from './components/Sidebar';
 import { NewRunForm } from './components/NewRunForm';
 import { ManualRunForm } from './components/ManualRunForm';
@@ -44,12 +44,16 @@ export default function App() {
     initialRoute.kind === 'run' ? initialRoute.id : null,
   );
   const [currentRun, setCurrentRun] = useState<Run | null>(null);
-  const [logs, setLogs] = useState<string[]>([]);
+  const [logs, setLogs] = useState<LogLine[]>([]);
   const [pendingSubject, setPendingSubject] = useState('');
   const [mode, setMode] = useState<'auto' | 'manual' | 'settings'>(
     initialRoute.kind === 'run' ? 'auto' : initialRoute.kind,
   );
   const sseRef = useRef<EventSource | null>(null);
+  // Track the highest event cursor we've received so we can resume SSE
+  // without replaying old events (which was causing log lines to duplicate
+  // every time the SSE reconnected via the reopenTimer).
+  const sseCursorRef = useRef<number>(0);
 
   // Sync URL hash whenever (selectedId, mode) changes. Use replaceState for
   // the initial load (so we don't leave an empty history entry), and pushState
@@ -132,18 +136,29 @@ export default function App() {
       setLogs([]);
       sseRef.current?.close();
       sseRef.current = null;
+      sseCursorRef.current = 0;
       return;
     }
     let cancelled = false;
     let lastOpenedActive = false;
     let reopenTimer: number | null = null;
+    // Fresh run → reset the event cursor so SSE replays history once.
+    sseCursorRef.current = 0;
 
     const openStream = () => {
       sseRef.current?.close();
-      const es = api.openEvents(selectedId);
+      // Resume from the cursor we last saw so reopened streams don't replay
+      // already-seen events (which previously duplicated log lines on every
+      // reconnect cycle).
+      const es = api.openEvents(selectedId, sseCursorRef.current);
       sseRef.current = es;
       es.onmessage = ev => {
         try {
+          // Track the event id so subsequent reconnects can skip ahead.
+          if (ev.lastEventId) {
+            const n = parseInt(ev.lastEventId, 10);
+            if (!isNaN(n) && n + 1 > sseCursorRef.current) sseCursorRef.current = n + 1;
+          }
           handleEvent(JSON.parse(ev.data));
         } catch {}
       };
@@ -157,7 +172,10 @@ export default function App() {
     api.get(selectedId).then(r => {
       if (cancelled) return;
       setCurrentRun(r);
-      setLogs(r.log_tail || []);
+      // DON'T pre-load logs from r.log_tail — SSE will replay the full event
+      // history from cursor=0 below, which already includes those same log lines.
+      // Pre-loading caused every line in log_tail to appear twice on initial load.
+      setLogs([]);
       lastOpenedActive = r.is_active;
       openStream();
     });
@@ -192,8 +210,12 @@ export default function App() {
 
   const handleEvent = (e: SseEvent) => {
     if (e.kind === 'log') {
+      const line: LogLine = {
+        ts: e.ts ?? Date.now() / 1000,
+        text: e.payload as string,
+      };
       setLogs(prev => {
-        const next = [...prev, e.payload as string];
+        const next = [...prev, line];
         return next.length > 1000 ? next.slice(-1000) : next;
       });
       return;
@@ -225,8 +247,13 @@ export default function App() {
     refreshList();
   };
 
-  const onManualRun = async (subject: string) => {
-    const r = await api.startManual(subject);
+  const onManualRun = async (subject: string, skipImages: boolean = false,
+                             comfyuiEngine?: 'ltx' | 'wan' | 'wan_s2v',
+                             clipCount: number = 5,
+                             clipDurationS: number = 10,
+                             maxWords?: number | null) => {
+    const r = await api.startManual(subject, skipImages, comfyuiEngine,
+                                    clipCount, clipDurationS, maxWords);
     setSelectedId(r.id);
     setLogs([]);
     refreshList();
@@ -240,7 +267,15 @@ export default function App() {
   const onRetry = async (from_step: any) => {
     if (!selectedId) return;
     await api.retry(selectedId, from_step);
+    // Server wiped the bus + bumped reset_epoch — close the existing SSE so
+    // the browser reconnects from cursor 0. Without this we keep sending the
+    // stale Last-Event-ID and the server has to rewind every reconnect,
+    // re-replaying already-displayed events.
     setLogs([]);
+    sseCursorRef.current = 0;
+    sseRef.current?.close();
+    sseRef.current = null;
+    // The selectedId-effect's reopenTimer will reopen the stream within 4s.
   };
 
   const onDelete = async (id: string) => {
@@ -300,6 +335,7 @@ export default function App() {
             logs={logs}
             onCancel={onCancel}
             onRetry={onRetry}
+            onClearLogs={() => setLogs([])}
           />
         ) : (
           <div className="p-8 text-zinc-500">Loading run…</div>

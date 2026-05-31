@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
-import type { RunOptions } from '../api';
+import { api, type RunOptions, type VideoProvider, type ComfyuiEngine } from '../api';
+import { ClipLengthControls } from './ClipLengthControls';
 
 const PLACEHOLDERS = [
   'e.g. smart factory automation',
@@ -28,6 +29,15 @@ export function NewRunForm({
   const [headless, setHeadless] = useState(false);
   const [skipUpload, setSkipUpload] = useState(false);
   const [parallel, setParallel] = useState(false);
+  const [skipImages, setSkipImages] = useState(false);
+  const [clipCount, setClipCount] = useState(5);
+  const [clipDurationS, setClipDurationS] = useState(10);
+  const [maxWords, setMaxWords] = useState<number | null>(null);
+  const [videoProvider, setVideoProvider] = useState<VideoProvider>('grok');
+  const [comfyuiEngine, setComfyuiEngine] = useState<ComfyuiEngine>(
+    (localStorage.getItem('comfyui_engine') as ComfyuiEngine) || 'ltx'
+  );
+  const [comfyuiReachable, setComfyuiReachable] = useState<boolean | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
@@ -40,18 +50,41 @@ export function NewRunForm({
     return () => clearInterval(id);
   }, []);
 
+  // Seed provider from the Settings-page default the first time this form mounts
+  useEffect(() => {
+    api.getSettings().then(s => {
+      if (s?.video_provider === 'grok' || s?.video_provider === 'comfyui') {
+        setVideoProvider(s.video_provider);
+      }
+      // Engine: prefer localStorage, then settings default
+      if (!localStorage.getItem('comfyui_engine') &&
+          ['ltx', 'wan', 'wan_s2v'].includes(s?.comfyui?.engine)) {
+        setComfyuiEngine(s.comfyui.engine);
+      }
+      setComfyuiReachable(!!s?.comfyui?.reachable);
+    }).catch(() => {});
+  }, []);
+
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!subject.trim()) return;
     setSubmitting(true);
     setError(null);
     try {
+      localStorage.setItem('video_provider', videoProvider);
+      localStorage.setItem('comfyui_engine', comfyuiEngine);
       await onSubmit({
         subject: subject.trim(),
         privacy,
         headless,
         skip_upload: skipUpload,
         parallel,
+        video_provider: videoProvider,
+        comfyui_engine: videoProvider === 'comfyui' ? comfyuiEngine : undefined,
+        skip_images: skipImages,
+        clip_count: clipCount,
+        clip_duration_s: clipDurationS,
+        max_words: maxWords,
       });
       onSubjectChange('');
     } catch (err: any) {
@@ -118,6 +151,126 @@ export function NewRunForm({
           </datalist>
         </div>
 
+        {/* Clip length controls */}
+        <ClipLengthControls
+          clipCount={clipCount} setClipCount={setClipCount}
+          clipDurationS={clipDurationS} setClipDurationS={setClipDurationS}
+          maxWords={maxWords} setMaxWords={setMaxWords}
+          accent="emerald"
+        />
+
+        {/* Video provider */}
+        <div>
+          <label className="block text-sm font-medium mb-2 text-zinc-300">
+            Video generator
+            <span className="text-zinc-500 font-normal"> — which backend renders the {clipCount} clips</span>
+          </label>
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              onClick={() => setVideoProvider('grok')}
+              className={
+                'px-3 py-2.5 rounded-md border text-left transition ' +
+                (videoProvider === 'grok'
+                  ? 'border-emerald-500/60 bg-emerald-500/10 text-zinc-100'
+                  : 'border-zinc-700 bg-zinc-900 text-zinc-400 hover:border-zinc-600')
+              }
+            >
+              <div className="flex items-center gap-2">
+                <span className="font-medium text-sm">Grok Imagine</span>
+                <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded
+                                 bg-zinc-800 text-zinc-400">cloud</span>
+              </div>
+              <div className="text-[11px] text-zinc-500 mt-0.5">
+                10s/clip, 720p I2V, Hindi lip-sync. Premium subscription.
+              </div>
+            </button>
+            <button
+              type="button"
+              onClick={() => setVideoProvider('comfyui')}
+              className={
+                'px-3 py-2.5 rounded-md border text-left transition ' +
+                (videoProvider === 'comfyui'
+                  ? 'border-emerald-500/60 bg-emerald-500/10 text-zinc-100'
+                  : 'border-zinc-700 bg-zinc-900 text-zinc-400 hover:border-zinc-600')
+              }
+            >
+              <div className="flex items-center gap-2">
+                <span className="font-medium text-sm">ComfyUI (LTX-2.3)</span>
+                <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded
+                                 bg-zinc-800 text-zinc-400">local</span>
+                {comfyuiReachable === false && (
+                  <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded
+                                   bg-red-500/10 text-red-300 border border-red-500/30">offline</span>
+                )}
+              </div>
+              <div className="text-[11px] text-zinc-500 mt-0.5">
+                T2V on your GPU. No quota, no cost. Hindi quality varies.
+              </div>
+            </button>
+          </div>
+          {videoProvider === 'comfyui' && comfyuiReachable === false && (
+            <div className="mt-2 text-xs text-red-300 bg-red-500/10 border border-red-500/30 rounded p-2">
+              ComfyUI is not reachable at the configured URL. Open <b>Settings → ComfyUI</b> to
+              set the right URL, or pick Grok above.
+            </div>
+          )}
+          {videoProvider === 'comfyui' && (
+            <div className="mt-2 rounded-md border border-zinc-800 bg-zinc-900/40 p-2.5">
+              <div className="text-[10px] uppercase tracking-wider text-zinc-500 mb-1.5">
+                ComfyUI engine
+              </div>
+              <div className="grid grid-cols-3 gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setComfyuiEngine('ltx')}
+                  className={
+                    'px-2 py-1.5 rounded text-left text-xs transition ' +
+                    (comfyuiEngine === 'ltx'
+                      ? 'border border-emerald-500/60 bg-emerald-500/10 text-zinc-100'
+                      : 'border border-zinc-700 bg-zinc-900 text-zinc-400 hover:border-zinc-600')
+                  }
+                >
+                  <div className="font-medium">LTX-2.3</div>
+                  <div className="text-[10px] text-zinc-500 mt-0.5">
+                    Fast diffusion. Text-only audio.
+                  </div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setComfyuiEngine('wan')}
+                  className={
+                    'px-2 py-1.5 rounded text-left text-xs transition ' +
+                    (comfyuiEngine === 'wan'
+                      ? 'border border-emerald-500/60 bg-emerald-500/10 text-zinc-100'
+                      : 'border border-zinc-700 bg-zinc-900 text-zinc-400 hover:border-zinc-600')
+                  }
+                >
+                  <div className="font-medium">Wan TI2V 5B</div>
+                  <div className="text-[10px] text-zinc-500 mt-0.5">
+                    Turbo Q8. ~1 min/clip. No lip-sync.
+                  </div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setComfyuiEngine('wan_s2v')}
+                  className={
+                    'px-2 py-1.5 rounded text-left text-xs transition ' +
+                    (comfyuiEngine === 'wan_s2v'
+                      ? 'border border-emerald-500/60 bg-emerald-500/10 text-zinc-100'
+                      : 'border border-zinc-700 bg-zinc-900 text-zinc-400 hover:border-zinc-600')
+                  }
+                >
+                  <div className="font-medium">Wan S2V 14B</div>
+                  <div className="text-[10px] text-zinc-500 mt-0.5">
+                    Q3 GGUF. Real lip-sync. Slower.
+                  </div>
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+
         {/* Primary option: privacy */}
         <div>
           <label className="block text-sm font-medium mb-2 text-zinc-300">YouTube privacy</label>
@@ -179,7 +332,19 @@ export function NewRunForm({
                 />
                 <span>Parallel generation</span>
                 <span className="text-xs text-zinc-500">
-                  — 5 images at once + multi-tab video gen. Faster (~7 min → ~3 min) but may stress Grok rate limits.
+                  — images at once + multi-tab video gen. Faster but may stress Grok rate limits.
+                </span>
+              </label>
+              <label className="flex items-center gap-2 text-sm cursor-pointer hover:text-zinc-100 transition">
+                <input
+                  type="checkbox"
+                  checked={skipImages}
+                  onChange={e => setSkipImages(e.target.checked)}
+                  className="accent-sky-500"
+                />
+                <span>Skip image generation (text-only video)</span>
+                <span className="text-xs text-zinc-500">
+                  — bypass Gemini image step. Character description goes straight into the video prompt.
                 </span>
               </label>
             </div>

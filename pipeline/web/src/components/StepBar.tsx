@@ -10,9 +10,15 @@ function stepState(run: Run, step: StepName): StepUiState {
   if (curIdx > idx) return 'done';
   // Derive done state from artifacts when run is not active
   if (!run.is_active) {
+    const expected = run.clip_count ?? 5;
     if (step === 'scripts' && run.artifacts.scripts_json) return 'done';
-    if (step === 'images' && run.artifacts.images.length >= 5) return 'done';
-    if (step === 'videos' && run.artifacts.videos.length >= 5) return 'done';
+    // skip_images runs intentionally produce 0 images — treat as done so the
+    // step bar doesn't stay yellow forever.
+    if (step === 'images') {
+      if (run.skip_images) return 'done';
+      if (run.artifacts.images.length >= expected) return 'done';
+    }
+    if (step === 'videos' && run.artifacts.videos.length >= expected) return 'done';
     if (step === 'merge' && run.artifacts.merged) return 'done';
     if (step === 'upload' && run.youtube_url) return 'done';
   }

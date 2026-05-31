@@ -119,6 +119,22 @@ domain.
 | **⚡ Auto run** | Full pipeline runs end-to-end (~5–7 min per video). |
 | **✋ Manual run** | Only scripts auto-generate; you trigger each image / clip / merge / upload step. |
 
+**Two video backends** (pick per-run from the Auto/Manual page, or set a default in Settings):
+
+| | Grok Imagine (cloud) | ComfyUI (LTX-2.3, local) |
+|---|---|---|
+| Quality | broadcast Hindi lip-sync | LTX-2.3 v1.1 distilled, English-tuned |
+| Cost | Premium subscription | $0 (your GPU) |
+| Speed | ~5 min / 10s clip | ~3–5 min / 10s clip on a 40 GB+ GPU |
+| Rate limits | yes (Grok quota) | none |
+| Image-to-video | yes (image = first frame) | yes (`LTXVImgToVideo`, image = first frame) |
+
+The ComfyUI provider uploads each clip's Gemini image to ComfyUI's `/upload/image`,
+injects a `LoadImage + LTXVImgToVideo` pair into the saved workflow at submit
+time, and downloads the rendered MP4 over HTTP via `/view`. **Works whether
+ComfyUI is on the same machine or a remote host on the LAN** — set `COMFYUI_URL`
+in Settings to whatever URL the FastAPI backend can reach.
+
 ---
 
 ## Highlights
@@ -215,8 +231,101 @@ Open **http://localhost:5180/** and click **Settings** to configure your keys.
 1. Open the app → **Settings** (sidebar)
 2. Paste your **Gemini API key**, pick text/image models
 3. Upload your **YouTube OAuth client_secret.json** (if you want to upload to YouTube)
-4. From a terminal, run `python3.13 steps/grok_session.py` once to log into Grok
-5. Done — go to **Auto run** or **Manual run** and pick a subject
+4. (Grok backend) From a terminal, run `python3.13 steps/grok_session.py` once to log into Grok
+5. (ComfyUI backend) Configure ComfyUI URL + workflow in Settings — see next section
+6. Done — go to **Auto run** or **Manual run**, pick the **video backend** (Grok or ComfyUI), and pick a subject
+
+---
+
+## ComfyUI backend — one-time setup
+
+The ComfyUI provider lets you run all video generation **locally on your own GPU**
+using the LTX-2.3 distilled 1.1 stack (NerdyRodent's recommended setup). After
+this one-time setup, the pipeline talks to ComfyUI over HTTP — no shared
+filesystem required.
+
+### 1. Install ComfyUI
+
+Any recent ComfyUI (≥ v0.20.1) with `ComfyUI-GGUF` and `ComfyUI-KJNodes` custom
+nodes. Easiest path is the Docker image `yanwk/comfyui-boot:cu128-megapak`.
+
+### 2. Download the required models
+
+Models go under `ComfyUI/models/`:
+
+| Path | File | Size | HuggingFace source |
+|---|---|---|---|
+| `diffusion_models/` | `ltx-2.3-22b-distilled-1.1_transformer_only_mxfp8_block32.safetensors` | 24 GB | [Kijai/LTX2.3_comfy](https://huggingface.co/Kijai/LTX2.3_comfy/tree/main/diffusion_models) |
+| `vae/` | `ltx-2.3-22b-distilled_audio_vae.safetensors` | 365 MB | [Lightricks/LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3) (extract from full ckpt) |
+| `vae/` | `ltx-2.3-22b-distilled_video_vae.safetensors` | 1.5 GB | [Lightricks/LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3) (extract from full ckpt) |
+| `loras/` | `ltx-2.3-22b-distilled-lora-384-1.1.safetensors` | 7.6 GB | [Lightricks/LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3/blob/main/ltx-2.3-22b-distilled-lora-384-1.1.safetensors) |
+| `text_encoders/` | `gemma-3-12b-it-qat-UD-Q4_K_XL.gguf` | 7 GB | [unsloth/gemma-3-12b-it-qat-GGUF](https://huggingface.co/unsloth/gemma-3-12b-it-qat-GGUF) |
+| `text_encoders/` | `ltx-2.3-22b-distilled_embeddings_connectors.safetensors` | ~700 MB | [Lightricks/LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3) (extract) |
+| `latent_upscale_models/` | `ltx-2.3-spatial-upscaler-x2-1.0.safetensors` | 600 MB | [Lightricks/LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3/blob/main/ltx-2.3-spatial-upscaler-x2-1.0.safetensors) |
+
+**Quick download commands** (using `hf` CLI — `pip install huggingface_hub`):
+```bash
+HF_HUB_ENABLE_HF_TRANSFER=1
+cd /path/to/ComfyUI/models
+
+hf download Kijai/LTX2.3_comfy \
+  diffusion_models/ltx-2.3-22b-distilled-1.1_transformer_only_mxfp8_block32.safetensors \
+  --local-dir /tmp/kijai_dl
+mv /tmp/kijai_dl/diffusion_models/* diffusion_models/
+
+hf download Lightricks/LTX-2.3 \
+  ltx-2.3-22b-distilled-lora-384-1.1.safetensors \
+  ltx-2.3-spatial-upscaler-x2-1.0.safetensors \
+  --local-dir /tmp/ltx_dl
+mv /tmp/ltx_dl/ltx-2.3-22b-distilled-lora-384-1.1.safetensors loras/
+mv /tmp/ltx_dl/ltx-2.3-spatial-upscaler-x2-1.0.safetensors latent_upscale_models/
+
+# Audio VAE + Video VAE + embeddings_connectors are extracted from the full
+# `ltx-2.3-22b-distilled-1.1.safetensors` checkpoint. Easiest path is the
+# pre-split files Kijai ships:
+hf download Kijai/LTX2.3_comfy \
+  vae/ltx-2.3-22b-distilled_audio_vae.safetensors \
+  vae/ltx-2.3-22b-distilled_video_vae.safetensors \
+  text_encoders/ltx-2.3-22b-distilled_embeddings_connectors.safetensors \
+  --local-dir /tmp/kijai_split
+mv /tmp/kijai_split/vae/* vae/
+mv /tmp/kijai_split/text_encoders/* text_encoders/
+
+hf download unsloth/gemma-3-12b-it-qat-GGUF \
+  gemma-3-12b-it-qat-UD-Q4_K_XL.gguf \
+  --local-dir text_encoders/
+```
+
+### 3. Install the workflow
+
+Open the ComfyUI web UI, then either:
+- **Download from this app**: Settings → ComfyUI section → **⬇ Download workflow JSON** button, then drag the file onto ComfyUI's canvas, and File → Save with name `ltx23_nerdy_rodent`. OR
+- Build it once using NerdyRodent's guide: https://youtu.be/IOJ0jA-9Ccc
+
+The workflow needs to expose these nodes (the pipeline auto-detects by class):
+`LTXVConditioning`, `CFGGuider`, `LTXVCropGuides`, `LTXVConcatAVLatent`, `VAELoaderKJ` (with `video_vae` in the filename).
+
+### 4. Point the pipeline at it
+
+Settings page → **ComfyUI** section:
+- **Server URL**: e.g. `http://127.0.0.1:8188` or `http://my-gpu-box:8188`
+- **Workflow**: pick `ltx23_nerdy_rodent` from the dropdown (auto-populated from `/userdata`)
+- **Default provider**: choose ComfyUI to make it the default on Auto/Manual pages
+
+The health pill turns green when reachable.
+
+### 5. Tunables (`.env` or env vars)
+
+| Var | Default | Effect |
+|---|---|---|
+| `COMFYUI_URL` | `http://127.0.0.1:8188` | ComfyUI server (any host on the network) |
+| `COMFYUI_WORKFLOW` | `ltx23_nerdy_rodent` | Saved workflow name |
+| `COMFYUI_I2V` | `1` | When `1`, upload each clip's image and lock it as the first frame |
+| `COMFYUI_I2V_STRENGTH` | `1.0` | Image conditioning weight (1.0 = pin frame, lower = looser) |
+| `COMFYUI_WIDTH` / `COMFYUI_HEIGHT` | `720` / `1280` | Render dimensions (9:16 default) |
+| `COMFYUI_FRAMES` | `241` | Frame count (must satisfy `(N-1)%8 == 0` for LTX) |
+
+---
 
 ---
 

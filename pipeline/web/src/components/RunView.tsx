@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
-import { STEP_LABEL, STEP_ORDER, type Run, type RunStatus, type StepName } from '../api';
+import { STEP_LABEL, STEP_ORDER, type Run, type RunStatus, type StepName, type LogLine } from '../api';
 import { StepBar } from './StepBar';
 import { LogPanel } from './LogPanel';
 import { ArtifactsPanel } from './ArtifactsPanel';
+import { RunSettingsPanel } from './RunSettingsPanel';
 
 // --- Status badge styling -------------------------------------------------
 const statusBadge: Record<RunStatus, { label: string; classes: string; dot: string }> = {
@@ -42,12 +43,13 @@ function useNow(active: boolean): number {
 }
 
 export function RunView({
-  run, logs, onCancel, onRetry,
+  run, logs, onCancel, onRetry, onClearLogs,
 }: {
   run: Run;
-  logs: string[];
+  logs: LogLine[];
   onCancel: () => Promise<void>;
   onRetry: (from: StepName) => Promise<void>;
+  onClearLogs?: () => void;
 }) {
   const [retryOpen, setRetryOpen] = useState(false);
   // Default: collapse logs for finished runs where they'd be empty; show them for live runs
@@ -216,11 +218,16 @@ export function RunView({
         <StepBar run={run} />
       </div>
 
+      {/* ============== Per-run settings (collapsible) ============== */}
+      <div className="px-6 py-2 border-b border-zinc-800 bg-zinc-950/20">
+        <RunSettingsPanel run={run} />
+      </div>
+
       {/* ============== Body (untouched layout) ============== */}
       <div className="flex-1 flex gap-4 p-4 overflow-hidden">
         {!logsCollapsed && (
           <div className="w-[380px] shrink-0">
-            <LogPanel logs={logs} />
+            <LogPanel logs={logs} onClear={onClearLogs} />
           </div>
         )}
         <div className="flex-1 min-w-0">

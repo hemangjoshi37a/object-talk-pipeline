@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { api, type Run } from '../api';
 import { ScriptsEditor } from './ScriptsEditor';
 
-const TOTAL_CLIPS = 5; // TODO: thread through from backend / settings if this ever varies
+// Total clips is now per-run (set in Auto/Manual form). Fallback to 5 for legacy runs.
 
 function ProgressChip({
   done, total, label, unlocked,
@@ -134,6 +134,7 @@ export function ArtifactsPanel({ run }: { run: Run }) {
     }
   };
 
+  const totalClips = run.clip_count ?? 5;
   const clipsReady = artifacts.videos.length;
   const canMerge = clipsReady > 0;
   const canUpload = !!artifacts.merged;
@@ -180,40 +181,79 @@ export function ArtifactsPanel({ run }: { run: Run }) {
       <div className="px-3 py-2 bg-zinc-900 border-b border-zinc-800 text-xs uppercase tracking-wider text-zinc-400 flex items-center justify-between">
         <span>Artifacts</span>
         <span className="text-[10px] normal-case text-zinc-500 font-mono">
-          {clipsReady}/{TOTAL_CLIPS} clips · {artifacts.merged ? 'merged ✓' : 'no merge'} · {run.youtube_url ? 'uploaded ✓' : 'not uploaded'}
+          {clipsReady}/{totalClips} clips · {artifacts.merged ? 'merged ✓' : 'no merge'} · {run.youtube_url ? 'uploaded ✓' : 'not uploaded'}
         </span>
       </div>
       <div className="flex-1 overflow-y-auto p-3 space-y-5">
-        {/* Distinct banner for the Grok video quota error — appears at the top
-            of the artifacts panel so it's impossible to miss. Surfaces the
-            specific actionable advice (wait + retry from videos step). */}
-        {run.error_kind === 'grok_quota' && (
-          <div className="rounded-lg border border-amber-500/40 bg-gradient-to-br from-amber-500/15 to-amber-500/5 p-4">
-            <div className="flex items-start gap-3">
-              <div className="text-2xl shrink-0">⛔</div>
-              <div className="flex-1 min-w-0">
-                <div className="text-sm font-semibold text-amber-200 mb-1">
-                  Grok video quota exhausted
-                </div>
-                <div className="text-xs text-amber-100/80 leading-relaxed">
-                  Grok refused to start the video generation — its &quot;Upgrade to SuperGrok&quot; modal opened.
-                  This is a rate-limit window, not a bug in the pipeline. Wait a few hours
-                  for the quota to roll over, then click <span className="font-mono px-1 py-0.5 rounded bg-amber-500/20">Retry from… → Videos</span> at
-                  the top of the run page. The scripts and images you already have will be reused.
-                </div>
-                <div className="mt-2 text-[10px] text-amber-100/50 font-mono break-all">
-                  log: {run.error_message || 'GROK_QUOTA_EXCEEDED'}
+        {/* Grok-side error banner — appears at the top so it's impossible
+            to miss. Copy adapts to the specific server signal (overload,
+            quota, generic rate-limit). The raw server message is always
+            shown verbatim so the user knows exactly what Grok said. */}
+        {run.error_kind && run.error_kind.startsWith('grok_') && (() => {
+          const variants: Record<string, { title: string; advice: string }> = {
+            grok_overload: {
+              title: 'Grok is under heavy load',
+              advice:
+                'The server refused to start a video generation right now ("Imagine is currently under heavy load. Try again later."). This is a transient capacity issue, not a quota or auth problem. Wait 15–30 min and click Retry from… → Videos.',
+            },
+            grok_rate_limit: {
+              title: 'Grok rate-limit reached',
+              advice:
+                'The server applied a short rate-limit. Wait a few minutes and click Retry from… → Videos.',
+            },
+            grok_quota: {
+              title: 'Grok video quota exhausted',
+              advice:
+                'Your Grok quota window is empty. Wait a few hours for the quota to roll over, then click Retry from… → Videos. Scripts and images you already have will be reused.',
+            },
+            grok_error: {
+              title: 'Grok refused the generation',
+              advice:
+                'Grok returned an unexpected error. Read the server message below — if it mentions login/auth, re-import cookies in Settings. Otherwise, wait and retry.',
+            },
+          };
+          const v = variants[run.error_kind] || variants.grok_error;
+          const cleaned = (run.error_message || '')
+            .replace(/^.*?GROK_QUOTA_EXCEEDED:\s*/, '')
+            .trim();
+          return (
+            <div className="rounded-lg border border-amber-500/40 bg-gradient-to-br from-amber-500/15 to-amber-500/5 p-4">
+              <div className="flex items-start gap-3">
+                <div className="text-2xl shrink-0">⛔</div>
+                <div className="flex-1 min-w-0">
+                  <div className="text-sm font-semibold text-amber-200 mb-1">
+                    {v.title}
+                  </div>
+                  <div className="text-xs text-amber-100/80 leading-relaxed">
+                    {v.advice.replace(/Retry from… → Videos/g, '')}
+                    {v.advice.includes('Retry') && (
+                      <span className="font-mono px-1 py-0.5 rounded bg-amber-500/20 ml-1">
+                        Retry from… → Videos
+                      </span>
+                    )}
+                  </div>
+                  {cleaned && (
+                    <div className="mt-2 rounded border border-amber-500/30 bg-amber-500/5 p-2">
+                      <div className="text-[10px] uppercase tracking-wider text-amber-300/70 mb-0.5">
+                        Server said
+                      </div>
+                      <div className="text-xs font-mono text-amber-100 break-all">
+                        {cleaned}
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
-          </div>
-        )}
+          );
+        })()}
 
         {artifacts.scripts_json ? (
           <ScriptsEditor
             runId={run.id}
             artifacts={artifacts}
             activeStep={run.is_active ? run.current_step : null}
+            skipImages={!!run.skip_images}
           />
         ) : (
           <div className="text-xs text-zinc-500 italic">scripts.json not generated yet…</div>
@@ -271,7 +311,7 @@ export function ArtifactsPanel({ run }: { run: Run }) {
             <div className="flex items-center gap-2">
               <ProgressChip
                 done={clipsReady}
-                total={TOTAL_CLIPS}
+                total={totalClips}
                 label="clips"
                 unlocked={canMerge}
               />
@@ -291,7 +331,7 @@ export function ArtifactsPanel({ run }: { run: Run }) {
           {!canMerge && (
             <div className="mt-2 text-[11px] text-zinc-500 flex items-center gap-1">
               <span>🔒</span>
-              <span>Merge unlocks when at least 1 clip is ready (you have {clipsReady}/{TOTAL_CLIPS}).</span>
+              <span>Merge unlocks when at least 1 clip is ready (you have {clipsReady}/{totalClips}).</span>
             </div>
           )}
 

@@ -124,13 +124,17 @@ function RegenButton({ onClick, busy }: { onClick: () => void; busy: boolean }) 
 }
 
 export function ScriptsEditor({
-  runId, artifacts,
+  runId, artifacts, skipImages = false,
 }: {
   runId: string;
   artifacts: Artifacts;
   // activeStep kept as an optional prop for callers, but we deliberately don't
   // use it to gate per-row busy state — each Generate button is independent.
   activeStep?: string | null;
+  // When true, the run was started in text-only mode — hide the Image column,
+  // image status dot, and image_prompt textarea so the UI matches what's
+  // actually running on the backend.
+  skipImages?: boolean;
 }) {
   const [data, setData] = useState<ScriptsPayload | null>(null);
   const [loading, setLoading] = useState(true);
@@ -156,8 +160,16 @@ export function ScriptsEditor({
       });
     }, timeoutMs);
     try {
-      if (kind === 'image') await api.regenImage(runId, idx);
-      else await api.regenVideo(runId, idx);
+      if (kind === 'image') {
+        await api.regenImage(runId, idx);
+      } else {
+        // Don't send a provider/engine override — the backend reads them from
+        // this run's `run_meta.json` (which the Run Settings panel writes to).
+        // Sending localStorage values here used to silently override the
+        // per-run choice the user just saved, picking ComfyUI even when the
+        // run was configured for Grok.
+        await api.regenVideo(runId, idx);
+      }
       // Do NOT clear busy on API return — the subprocess is still working.
     } catch (e: any) {
       setError(`${kind} regen #${idx}: ${e.message}`);
@@ -292,12 +304,19 @@ export function ScriptsEditor({
             Scripts <span className="text-zinc-600">({data.scripts.length})</span>
           </div>
           <div className="flex items-center gap-1.5 text-[10px] text-zinc-500">
-            <span className="px-1.5 py-0.5 rounded bg-zinc-900 border border-zinc-800">
-              🖼 {imageCount}/{data.scripts.length}
-            </span>
+            {!skipImages && (
+              <span className="px-1.5 py-0.5 rounded bg-zinc-900 border border-zinc-800">
+                🖼 {imageCount}/{data.scripts.length}
+              </span>
+            )}
             <span className="px-1.5 py-0.5 rounded bg-zinc-900 border border-zinc-800">
               🎬 {videoCount}/{data.scripts.length}
             </span>
+            {skipImages && (
+              <span className="px-1.5 py-0.5 rounded bg-sky-500/10 border border-sky-500/30 text-sky-300">
+                text-only mode
+              </span>
+            )}
           </div>
           {dirty && (
             <span className="text-[10px] text-amber-400 normal-case flex items-center gap-1">
@@ -309,11 +328,12 @@ export function ScriptsEditor({
         <div className="flex items-center gap-2">
           <button
             onClick={async () => {
-              if (!confirm('Regenerate ALL 5 scripts from scratch via Gemini? Your edits will be lost.')) return;
+              const n = data.scripts.length;
+              if (!confirm(`Regenerate ALL ${n} scripts from scratch via Gemini? Your edits will be lost.`)) return;
               try { await api.regenScripts(runId); } catch (e: any) { setError(e.message); }
             }}
             className="text-xs px-2 py-1 rounded border border-zinc-700 bg-zinc-800/70 text-zinc-300 hover:bg-zinc-700 hover:border-zinc-600 transition"
-            title="Regenerate all 5 scripts via Gemini (overwrites current)"
+            title={`Regenerate all ${data.scripts.length} scripts via Gemini (overwrites current)`}
           >
             ↻ All scripts
           </button>
@@ -341,8 +361,13 @@ export function ScriptsEditor({
         return (
           <div
             key={i}
-            className="rounded-lg border border-zinc-800 bg-zinc-900/50 hover:border-zinc-700 transition-colors p-3
-                       grid grid-cols-[20px_1fr_minmax(160px,180px)_minmax(160px,180px)] gap-3 items-start"
+            className={
+              'rounded-lg border border-zinc-800 bg-zinc-900/50 hover:border-zinc-700 transition-colors p-3 ' +
+              'grid gap-3 items-start ' +
+              (skipImages
+                ? 'grid-cols-[20px_1fr_minmax(180px,200px)]'
+                : 'grid-cols-[20px_1fr_minmax(160px,180px)_minmax(160px,180px)]')
+            }
           >
             {/* Status track */}
             <div className="flex flex-col items-center gap-1.5 pt-1">
@@ -353,15 +378,17 @@ export function ScriptsEditor({
                 state={scriptOk ? 'ok' : 'pending'}
                 hint={`Script ${scriptOk ? 'ready' : 'incomplete'} (${s.word_count}/48 words)`}
               />
-              <StatusDot
-                label="Image"
-                state={img ? 'ok' : imgBusy ? 'pending' : 'blocked'}
-                hint={img ? 'Image ready' : imgBusy ? 'Image generating…' : 'Image not generated'}
-              />
+              {!skipImages && (
+                <StatusDot
+                  label="Image"
+                  state={img ? 'ok' : imgBusy ? 'pending' : 'blocked'}
+                  hint={img ? 'Image ready' : imgBusy ? 'Image generating…' : 'Image not generated'}
+                />
+              )}
               <StatusDot
                 label="Clip"
                 state={vid ? 'ok' : vidBusy ? 'pending' : 'blocked'}
-                hint={vid ? 'Clip ready' : vidBusy ? 'Clip generating…' : !img ? 'Needs image first' : 'Clip not generated'}
+                hint={vid ? 'Clip ready' : vidBusy ? 'Clip generating…' : (!skipImages && !img) ? 'Needs image first' : 'Clip not generated'}
               />
             </div>
 
@@ -416,8 +443,12 @@ export function ScriptsEditor({
               </div>
               <div>
                 <div className="text-[10px] uppercase text-zinc-500 mb-0.5 tracking-wider flex items-center gap-1.5">
-                  <span>Image prompt</span>
-                  <span className="text-zinc-600 normal-case lowercase">— first-frame style (Pixar look)</span>
+                  <span>{skipImages ? 'Subject / character description' : 'Image prompt'}</span>
+                  <span className="text-zinc-600 normal-case lowercase">
+                    {skipImages
+                      ? '— used directly in the video prompt (no image gen)'
+                      : '— first-frame style (Pixar look)'}
+                  </span>
                 </div>
                 <textarea
                   value={s.image_prompt}
@@ -428,34 +459,36 @@ export function ScriptsEditor({
               </div>
             </div>
 
-            {/* Image column */}
-            <div className="space-y-1">
-              <div className="text-[10px] uppercase text-zinc-500 tracking-wider">Image</div>
-              {img ? (
-                <div className={`relative group ${imgBusy ? 'opacity-50' : ''}`}>
-                  <a href={img} target="_blank" rel="noreferrer" title={s.object}>
-                    <img
-                      src={img}
-                      alt={s.object}
-                      className="w-full aspect-[9/16] object-cover rounded-md border border-zinc-800 hover:border-emerald-500/60 transition"
+            {/* Image column (hidden in skipImages mode) */}
+            {!skipImages && (
+              <div className="space-y-1">
+                <div className="text-[10px] uppercase text-zinc-500 tracking-wider">Image</div>
+                {img ? (
+                  <div className={`relative group ${imgBusy ? 'opacity-50' : ''}`}>
+                    <a href={img} target="_blank" rel="noreferrer" title={s.object}>
+                      <img
+                        src={img}
+                        alt={s.object}
+                        className="w-full aspect-[9/16] object-cover rounded-md border border-zinc-800 hover:border-emerald-500/60 transition"
+                      />
+                    </a>
+                    <RegenButton
+                      onClick={() => regen('image', idx)}
+                      busy={imgBusy}
                     />
-                  </a>
-                  <RegenButton
-                    onClick={() => regen('image', idx)}
+                  </div>
+                ) : (
+                  <MediaPlaceholder
+                    kind="image"
+                    onGenerate={() => regen('image', idx)}
                     busy={imgBusy}
                   />
+                )}
+                <div className="text-[10px] text-zinc-500 truncate" title={s.object}>
+                  {s.object || '—'}
                 </div>
-              ) : (
-                <MediaPlaceholder
-                  kind="image"
-                  onGenerate={() => regen('image', idx)}
-                  busy={imgBusy}
-                />
-              )}
-              <div className="text-[10px] text-zinc-500 truncate" title={s.object}>
-                {s.object || '—'}
               </div>
-            </div>
+            )}
 
             {/* Video column */}
             <div className="space-y-1">

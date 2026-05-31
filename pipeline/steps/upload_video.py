@@ -24,10 +24,10 @@ GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{mode
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload",
           "https://www.googleapis.com/auth/youtube"]
 
-METADATA_PROMPT = """Given the subject and 5 Object-Talk Hindi scripts below, produce YouTube metadata for a 50-second Shorts upload that combines all 5 clips.
+METADATA_PROMPT = """Given the subject and the __N_CLIPS__ Object-Talk Hindi scripts below, produce YouTube metadata for a __TOTAL_S__-second Shorts upload that combines all __N_CLIPS__ clips.
 
 ZERO-HALLUCINATION RULES (these override creative latitude):
-- Use ONLY the 5 object names exactly as they appear in the scripts below — do not rename, abbreviate, or invent variants
+- Use ONLY the __N_CLIPS__ object names exactly as they appear in the scripts below — do not rename, abbreviate, or invent variants
 - Do NOT invent numeric statistics ("makes it 3x faster", "lasts 10 years") — use qualitative language only
 - Do NOT invent brand names, product models, certifications, standards, or awards
 - Do NOT make medical, financial, or safety claims that aren't generic common knowledge
@@ -36,8 +36,8 @@ ZERO-HALLUCINATION RULES (these override creative latitude):
 
 Return strict JSON only:
 {
-  "title": "<≤95 chars, Hindi+English mix, must include the 5 object names verbatim, attention-grabbing, no emojis, no fake stats>",
-  "description": "<3-6 short paragraphs (Hindi+English): a hook, a bulleted list naming all 5 objects with 1 line each describing ONLY their real function from the scripts, a Shorts hashtag block at the end. 800-1500 chars total. No invented numbers, no fake brand mentions, no emojis.>",
+  "title": "<≤95 chars, Hindi+English mix, must include all __N_CLIPS__ object names verbatim, attention-grabbing, no emojis, no fake stats>",
+  "description": "<3-6 short paragraphs (Hindi+English): a hook, a bulleted list naming all __N_CLIPS__ objects with 1 line each describing ONLY their real function from the scripts, a Shorts hashtag block at the end. 800-1500 chars total. No invented numbers, no fake brand mentions, no emojis.>",
   "tags": ["<15-25 SEO tags, mix of English and Hindi/Hinglish, lowercase, no #, only real domain terms>"],
   "category_id": "<one of: 22 (People&Blogs), 27 (Education), 28 (Sci&Tech), 26 (How-to)>"
 }
@@ -54,10 +54,15 @@ def generate_metadata(subject: str, scripts_payload: dict) -> dict:
         f"{i}. {s['object']}: {s['hindi_script']}"
         for i, s in enumerate(scripts_payload["scripts"], 1)
     )
+    n_clips = len(scripts_payload.get("scripts", []))
+    duration_s = int(scripts_payload.get("clip_duration_s") or 10)
+    total_s = n_clips * duration_s
     # Avoid str.format here: the prompt contains literal { } JSON braces.
     prompt = (METADATA_PROMPT
               .replace("__SUBJECT__", subject)
-              .replace("__SCRIPTS_BLOCK__", scripts_block))
+              .replace("__SCRIPTS_BLOCK__", scripts_block)
+              .replace("__N_CLIPS__", str(n_clips))
+              .replace("__TOTAL_S__", str(total_s)))
     body = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {
@@ -71,11 +76,46 @@ def generate_metadata(subject: str, scripts_payload: dict) -> dict:
     r = post_with_retry(url, json=body, timeout=120, label="metadata")
     r.raise_for_status()
     text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-    meta = json.loads(text)
+    # Gemini sometimes wraps JSON in ```json fences or appends prose after the
+    # JSON object — a plain json.loads fails on "Extra data" then. Extract the
+    # first balanced JSON object the way generate_scripts does.
+    meta = _extract_json(text)
     # sanity
-    if len(meta["title"]) > 100:
+    if len(meta.get("title", "")) > 100:
         meta["title"] = meta["title"][:97] + "..."
     return meta
+
+
+def _extract_json(text: str) -> dict:
+    """Pull the first balanced JSON object out of a Gemini text response.
+
+    Robust to:
+      - ```json fences
+      - leading/trailing prose
+      - trailing extra content after the JSON object
+    """
+    import re
+    text = text.strip()
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fence:
+        text = fence.group(1)
+    start = text.find("{")
+    if start == -1:
+        raise ValueError(f"No JSON object found in metadata response:\n{text[:500]}")
+    depth = 0
+    end = -1
+    for i in range(start, len(text)):
+        c = text[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    if end == -1:
+        raise ValueError(f"Unbalanced JSON object in metadata response:\n{text[start:start+500]}")
+    return json.loads(text[start:end+1])
 
 
 def get_credentials() -> Credentials:

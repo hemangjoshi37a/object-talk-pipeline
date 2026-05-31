@@ -3,7 +3,42 @@
 export type RunStatus = 'idle' | 'running' | 'done' | 'error' | 'cancelled';
 export type StepName = 'scripts' | 'images' | 'videos' | 'merge' | 'upload';
 
-export type ErrorKind = 'grok_quota' | null;
+export type ErrorKind =
+  | 'grok_quota'        // user's Grok quota exhausted
+  | 'grok_rate_limit'   // server-side rate-limit toast
+  | 'grok_overload'     // "Imagine is currently under heavy load"
+  | 'grok_error'        // any other Grok refusal
+  | null;
+
+export interface GrokProfile {
+  profile_path: string;
+  state: 'missing' | 'anonymous' | 'authenticated';
+  logged_in: boolean;
+  cookies_count: number;
+  host_count: number;
+  session_cookies: string[];
+  profile_age_s: number | null;
+  cookies_age_s: number | null;
+}
+
+export interface RunSettings {
+  video_provider: 'grok' | 'comfyui' | null;
+  comfyui_engine: 'ltx' | 'wan' | 'wan_s2v' | null;
+  skip_images: boolean;
+  skip_upload: boolean;
+  headless: boolean;
+  parallel: boolean;
+  privacy: 'public' | 'unlisted' | 'private';
+  clip_count: number;
+  clip_duration_s: number;
+  max_words: number | null;
+  manual_mode: boolean;
+}
+
+export interface LogLine {
+  ts: number;             // unix timestamp (seconds) the bus saw the line
+  text: string;
+}
 
 export interface Run {
   id: string;             // == slug == output dir name
@@ -16,9 +51,16 @@ export interface Run {
   youtube_url: string | null;
   artifacts: Artifacts;
   is_active: boolean;     // a worker is currently running it
-  log_tail: string[];     // last N log lines (for snapshot)
+  log_tail: LogLine[];    // last N log lines with timestamps (for snapshot)
   error_kind?: ErrorKind;
   error_message?: string | null;
+  // Legacy flat fields kept for back-compat with existing components.
+  skip_images?: boolean;
+  clip_count?: number;
+  clip_duration_s?: number;
+  // Full per-run settings panel — persisted in run_meta.json, surfaces here
+  // so the run view can show + edit them.
+  settings?: RunSettings;
 }
 
 export interface Artifacts {
@@ -29,6 +71,9 @@ export interface Artifacts {
   metadata_json: string | null;
 }
 
+export type VideoProvider = 'grok' | 'comfyui';
+export type ComfyuiEngine = 'ltx' | 'wan' | 'wan_s2v';
+
 export interface RunOptions {
   subject: string;
   privacy?: 'public' | 'unlisted' | 'private';
@@ -36,11 +81,18 @@ export interface RunOptions {
   skip_upload?: boolean;
   parallel?: boolean;
   from_step?: StepName;
+  video_provider?: VideoProvider;
+  comfyui_engine?: ComfyuiEngine;
+  skip_images?: boolean;
+  clip_count?: number;        // 1-20
+  clip_duration_s?: number;   // 5-30
+  max_words?: number | null;  // null → backend computes from duration
 }
 
 export interface SseEvent {
   kind: 'log' | 'step' | 'progress' | 'artifact' | 'status' | 'youtube' | 'error';
   payload: any;
+  ts?: number;            // backend now stamps every event; absent on legacy
 }
 
 const j = async <T>(r: Response): Promise<T> => {
@@ -105,18 +157,52 @@ export const api = {
   async remove(id: string): Promise<{ ok: true }> {
     return j(await fetch(`/api/runs/${id}`, { method: 'DELETE' }));
   },
-  openEvents(id: string): EventSource {
-    return new EventSource(`/api/runs/${id}/events`);
+  async updateRunSettings(id: string, patch: Partial<RunSettings>): Promise<Run> {
+    return j<Run>(
+      await fetch(`/api/runs/${id}/settings`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      }),
+    );
+  },
+  openEvents(id: string, sinceCursor: number = 0): EventSource {
+    // ?cursor= lets the server skip events the client has already seen so we
+    // don't duplicate the log_tail every time the SSE reopens.
+    const url = sinceCursor > 0
+      ? `/api/runs/${id}/events?cursor=${sinceCursor}`
+      : `/api/runs/${id}/events`;
+    return new EventSource(url);
   },
   async regenScripts(id: string): Promise<Run> {
     return j<Run>(await fetch(`/api/runs/${id}/regen/scripts`, { method: 'POST' }));
   },
-  async startManual(subject: string): Promise<Run> {
+  async startManual(subject: string, skip_images: boolean = false,
+                    comfyui_engine?: ComfyuiEngine,
+                    clip_count: number = 5,
+                    clip_duration_s: number = 10,
+                    max_words?: number | null): Promise<Run> {
     return j<Run>(
       await fetch('/api/runs/manual', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ subject }),
+        body: JSON.stringify({ subject, skip_images, comfyui_engine, clip_count, clip_duration_s, max_words }),
+      }),
+    );
+  },
+  async putComfyuiSettings(body: {
+    url?: string;
+    workflow?: string;
+    video_provider?: VideoProvider;
+    vbvr_lora?: string;
+    vbvr_strength?: number;
+    i2v_strength?: number;
+  }): Promise<any> {
+    return j(
+      await fetch('/api/settings/comfyui', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
       }),
     );
   },
@@ -132,8 +218,16 @@ export const api = {
       }),
     );
   },
-  async regenVideo(id: string, idx: number): Promise<Run> {
-    return j<Run>(await fetch(`/api/runs/${id}/regen/video/${idx}`, { method: 'POST' }));
+  async regenVideo(id: string, idx: number, video_provider?: VideoProvider,
+                   comfyui_engine?: ComfyuiEngine): Promise<Run> {
+    const body: any = {};
+    if (video_provider) body.video_provider = video_provider;
+    if (comfyui_engine) body.comfyui_engine = comfyui_engine;
+    return j<Run>(await fetch(`/api/runs/${id}/regen/video/${idx}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }));
   },
   async manualMerge(id: string): Promise<Run> {
     return j<Run>(await fetch(`/api/runs/${id}/merge`, { method: 'POST' }));
@@ -186,6 +280,34 @@ export const api = {
   },
   async clearYouTubeToken(): Promise<any> {
     return j(await fetch('/api/settings/youtube/token', { method: 'DELETE' }));
+  },
+  async getGrokProfile(): Promise<GrokProfile> {
+    return j<GrokProfile>(await fetch('/api/settings/grok/profile'));
+  },
+  async grokLogout(): Promise<GrokProfile> {
+    return j<GrokProfile>(
+      await fetch('/api/settings/grok/profile', { method: 'DELETE' }),
+    );
+  },
+  async grokLogin(timeoutS: number = 600): Promise<{ ok: boolean; message: string }> {
+    return j(
+      await fetch('/api/settings/grok/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ timeout_s: timeoutS }),
+      }),
+    );
+  },
+  async grokImportCookies(cookies: any[]): Promise<{
+    ok: boolean; imported: number; ignored: number; status: GrokProfile;
+  }> {
+    return j(
+      await fetch('/api/settings/grok/cookies', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cookies }),
+      }),
+    );
   },
   async getTrending(geo = 'IN', category = 'any', refresh = false): Promise<{
     trending: { subject: string; category: string; reason: string }[];
