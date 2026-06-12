@@ -40,8 +40,11 @@ export interface LogLine {
   text: string;
 }
 
+export type RunKind = 'object_talk' | 'product_video';
+
 export interface Run {
   id: string;             // == slug == output dir name
+  kind?: RunKind;
   subject: string;
   status: RunStatus;
   current_step: StepName | null;
@@ -63,12 +66,27 @@ export interface Run {
   settings?: RunSettings;
 }
 
+export interface ProductVideoArtifacts {
+  plan: string | null;
+  briefs: string[];
+  starters: string[];
+  last_frames: string[];
+  product_images: string[];
+  scraped_text: string | null;
+  approvals: {
+    awaiting: number | null;
+    approved: number[];
+    rejected: number[];
+  };
+}
+
 export interface Artifacts {
   scripts_json: string | null;       // /files/<id>/scripts.json or null
   images: string[];                  // /files/<id>/img_*
   videos: string[];                  // /files/<id>/vid_*
   merged: string | null;             // /files/<id>/merge.mp4
   metadata_json: string | null;
+  product_video?: ProductVideoArtifacts;
 }
 
 export type VideoProvider = 'grok' | 'comfyui';
@@ -89,8 +107,15 @@ export interface RunOptions {
   max_words?: number | null;  // null → backend computes from duration
 }
 
+export type SseEventKind =
+  | 'log' | 'step' | 'progress' | 'artifact' | 'status' | 'youtube' | 'error'
+  | 'error_kind'
+  | 'plan_ready' | 'clip_brief_ready' | 'clip_brief_refined'
+  | 'starter_ready' | 'clip_video_ready'
+  | 'last_frame_ready' | 'awaiting_approval' | 'approved';
+
 export interface SseEvent {
-  kind: 'log' | 'step' | 'progress' | 'artifact' | 'status' | 'youtube' | 'error';
+  kind: SseEventKind;
   payload: any;
   ts?: number;            // backend now stamps every event; absent on legacy
 }
@@ -341,3 +366,93 @@ export const STEP_LABEL: Record<StepName, string> = {
   merge: 'Merge',
   upload: 'Upload',
 };
+
+// ── Product-video flow ──────────────────────────────────────────────────────
+// Lives alongside the existing object-talk flow. Endpoints under /api/products
+// and /api/runs/{id}/product-video and /api/runs/{id}/plan etc.
+
+export interface ProductVideoOptions {
+  review_mode: 'auto' | 'per_clip';
+  clip_count: number;
+  clip_duration_s: number;
+  skip_upload?: boolean;
+  privacy?: 'public' | 'unlisted' | 'private';
+  parallel?: boolean;
+  headless?: boolean;
+}
+
+export async function createProduct(
+  form: FormData,
+): Promise<{ run_id: string; product: any }> {
+  return j<{ run_id: string; product: any }>(
+    await fetch('/api/products', {
+      method: 'POST',
+      body: form,
+    }),
+  );
+}
+
+export async function startProductVideo(
+  runId: string,
+  opts: ProductVideoOptions,
+): Promise<Run> {
+  return j<Run>(
+    await fetch(`/api/runs/${runId}/product-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(opts),
+    }),
+  );
+}
+
+export async function getPlan(runId: string): Promise<any> {
+  return j(await fetch(`/api/runs/${runId}/plan`));
+}
+
+export async function savePlan(runId: string, plan: any): Promise<any> {
+  return j(
+    await fetch(`/api/runs/${runId}/plan`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(plan),
+    }),
+  );
+}
+
+export async function getBrief(runId: string, idx: number): Promise<any> {
+  return j(await fetch(`/api/runs/${runId}/brief/${idx}`));
+}
+
+export async function saveBrief(
+  runId: string,
+  idx: number,
+  brief: any,
+): Promise<any> {
+  return j(
+    await fetch(`/api/runs/${runId}/brief/${idx}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(brief),
+    }),
+  );
+}
+
+export async function approveClip(runId: string, idx: number): Promise<void> {
+  const r = await fetch(`/api/runs/${runId}/approve/${idx}`, {
+    method: 'POST',
+  });
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText}: ${await r.text()}`);
+}
+
+export async function rejectClip(
+  runId: string,
+  idx: number,
+  body: { reason?: string; edit_brief?: any },
+): Promise<void> {
+  const r = await fetch(`/api/runs/${runId}/reject/${idx}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText}: ${await r.text()}`);
+}

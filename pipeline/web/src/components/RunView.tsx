@@ -1,9 +1,15 @@
-import { useEffect, useRef, useState } from 'react';
-import { STEP_LABEL, STEP_ORDER, type Run, type RunStatus, type StepName, type LogLine } from '../api';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  STEP_LABEL, STEP_ORDER,
+  approveClip, getBrief, getPlan, rejectClip, saveBrief, savePlan,
+  type Run, type RunStatus, type StepName, type LogLine,
+} from '../api';
 import { StepBar } from './StepBar';
 import { LogPanel } from './LogPanel';
 import { ArtifactsPanel } from './ArtifactsPanel';
 import { RunSettingsPanel } from './RunSettingsPanel';
+import { PlanReviewView } from './PlanReviewView';
+import { ContinuityTimeline } from './ContinuityTimeline';
 
 // --- Status badge styling -------------------------------------------------
 const statusBadge: Record<RunStatus, { label: string; classes: string; dot: string }> = {
@@ -51,6 +57,72 @@ export function RunView({
   onRetry: (from: StepName) => Promise<void>;
   onClearLogs?: () => void;
 }) {
+  const isProductVideo = run.kind === 'product_video';
+  const productArts = run.artifacts.product_video;
+  const [plan, setPlan] = useState<any | null>(null);
+  const [briefs, setBriefs] = useState<Record<number, any>>({});
+
+  // Fetch plan + briefs when the artifact URLs appear/change. Each artifact URL
+  // is /files/<id>/... so we use the dedicated JSON endpoints instead.
+  const planUrl = productArts?.plan ?? null;
+  const briefUrls = productArts?.briefs?.join('|') ?? '';
+  useEffect(() => {
+    if (!isProductVideo) return;
+    if (!planUrl) { setPlan(null); return; }
+    let cancelled = false;
+    getPlan(run.id).then(p => { if (!cancelled) setPlan(p); }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [isProductVideo, run.id, planUrl]);
+
+  useEffect(() => {
+    if (!isProductVideo) return;
+    const arr = productArts?.briefs ?? [];
+    if (arr.length === 0) { setBriefs({}); return; }
+    let cancelled = false;
+    Promise.all(arr.map(async url => {
+      const m = url.match(/brief_(\d+)\.json$/);
+      if (!m) return null;
+      const idx = parseInt(m[1], 10);
+      try {
+        const data = await getBrief(run.id, idx);
+        return [idx, data] as const;
+      } catch {
+        return null;
+      }
+    })).then(results => {
+      if (cancelled) return;
+      const next: Record<number, any> = {};
+      for (const r of results) if (r) next[r[0]] = r[1];
+      setBriefs(next);
+    });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isProductVideo, run.id, briefUrls]);
+
+  const onSavePlan = useCallback(async (next: any) => {
+    const saved = await savePlan(run.id, next);
+    setPlan(saved);
+  }, [run.id]);
+
+  const onSaveBrief = useCallback(async (idx: number, next: any) => {
+    const saved = await saveBrief(run.id, idx, next);
+    setBriefs(prev => ({ ...prev, [idx]: saved }));
+  }, [run.id]);
+
+  const onApprove = useCallback(async (idx: number) => {
+    await approveClip(run.id, idx);
+  }, [run.id]);
+
+  const onReject = useCallback(async (idx: number, reason?: string) => {
+    await rejectClip(run.id, idx, { reason });
+  }, [run.id]);
+
+  const reviewMode: 'auto' | 'per_clip' =
+    (run as any)?.settings?.review_mode === 'per_clip' ? 'per_clip' : 'auto';
+  const clipCount = Array.isArray(plan?.clips)
+    ? plan.clips.length
+    : (run.settings?.clip_count ?? run.clip_count ?? 0);
+
   const [retryOpen, setRetryOpen] = useState(false);
   // Default: collapse logs for finished runs where they'd be empty; show them for live runs
   const [logsCollapsed, setLogsCollapsed] = useState(!run.is_active && logs.length === 0);
@@ -230,8 +302,34 @@ export function RunView({
             <LogPanel logs={logs} onClear={onClearLogs} />
           </div>
         )}
-        <div className="flex-1 min-w-0">
-          <ArtifactsPanel run={run} />
+        <div className="flex-1 min-w-0 overflow-y-auto">
+          {isProductVideo ? (
+            <div className="space-y-6">
+              <PlanReviewView
+                runId={run.id}
+                plan={plan}
+                briefs={briefs}
+                onSavePlan={onSavePlan}
+                onSaveBrief={onSaveBrief}
+              />
+              <ContinuityTimeline
+                runId={run.id}
+                clipCount={clipCount}
+                artifacts={{
+                  starters: productArts?.starters ?? [],
+                  videos: run.artifacts.videos ?? [],
+                  last_frames: productArts?.last_frames ?? [],
+                  product_images: productArts?.product_images ?? [],
+                }}
+                approvals={productArts?.approvals ?? { awaiting: null, approved: [], rejected: [] }}
+                reviewMode={reviewMode}
+                onApprove={onApprove}
+                onReject={onReject}
+              />
+            </div>
+          ) : (
+            <ArtifactsPanel run={run} />
+          )}
         </div>
       </div>
     </div>

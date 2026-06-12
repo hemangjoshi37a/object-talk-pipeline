@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -38,6 +38,7 @@ ROOT = Path(__file__).resolve().parent
 OUTPUT_DIR = ROOT / "output"
 WEB_DIST = ROOT / "web" / "dist"
 PIPELINE_SCRIPT = ROOT / "pipeline.py"
+PRODUCT_PIPELINE_SCRIPT = ROOT / "pipeline_product.py"
 PYTHON = sys.executable or "python3.13"
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -45,6 +46,10 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 STEP_ORDER = ["scripts", "images", "videos", "merge", "upload"]
 STEP_FROM_HEADER = {  # parses lines like ">>> Step 1/5: generate scripts"
     1: "scripts", 2: "images", 3: "videos", 4: "merge", 5: "upload",
+}
+PRODUCT_STEP_FROM_HEADER = {  # parses lines like ">>> Step 4/7.2: starter image for clip 2"
+    1: "scrape", 2: "plan", 3: "briefs",
+    4: "starter", 5: "clip_video", 6: "last_frame", 7: "merge",
 }
 
 # ---------- Run bus (shared event stream per run_id) ----------
@@ -277,6 +282,11 @@ class Job:
             bus.current_step = STEP_FROM_HEADER.get(int(m.group(1)))
             bus.emit("step", bus.current_step)
             return
+        m = re.search(r">>> Step (\d+)/7(?:\.(\d+))?:", line)
+        if m:
+            bus.current_step = PRODUCT_STEP_FROM_HEADER.get(int(m.group(1)))
+            bus.emit("step", bus.current_step)
+            return
         m = re.match(r"\[(\d+)/5\]\s", line)
         if m:
             done = int(m.group(1)) - 1
@@ -316,6 +326,40 @@ class Job:
                 bus.error_kind = "grok_error"
             bus.error_message = line.strip()
             bus.emit("error_kind", {"kind": bus.error_kind, "message": line.strip()})
+            return
+        # Product-video pipeline markers: emit dedicated SSE events so the new
+        # UI timeline can highlight per-clip progress without parsing log text.
+        if ">>> Plan ready" in line:
+            bus.emit("plan_ready", None)
+            return
+        m = re.search(r">>> Brief ready:\s*(\d+)", line)
+        if m:
+            bus.emit("clip_brief_ready", {"clip": int(m.group(1))})
+            return
+        m = re.search(r">>> Brief refined:\s*(\d+)", line)
+        if m:
+            bus.emit("clip_brief_refined", {"clip": int(m.group(1))})
+            return
+        m = re.search(r">>> Starter ready:\s*(\d+)", line)
+        if m:
+            bus.emit("starter_ready", {"clip": int(m.group(1))})
+            return
+        m = re.search(r">>> Clip video ready:\s*(\d+)", line)
+        if m:
+            bus.emit("clip_video_ready", {"clip": int(m.group(1))})
+            return
+        m = re.search(r">>> Last frame ready:\s*(\d+)", line)
+        if m:
+            bus.emit("last_frame_ready", {"clip": int(m.group(1))})
+            return
+        m = re.search(r">>> Awaiting approval:\s*(\d+)", line)
+        if m:
+            bus.emit("awaiting_approval", {"clip": int(m.group(1))})
+            return
+        m = re.search(r">>> Approved:\s*(\d+)", line)
+        if m:
+            bus.emit("approved", {"clip": int(m.group(1))})
+            return
 
     def _artifact_scanner(self) -> None:
         last_snapshot: dict | None = None
@@ -371,6 +415,7 @@ def artifacts_for(run_id: str) -> dict:
             "videos": [],
             "merged": None,
             "metadata_json": None,
+            "product_video": _product_video_artifacts(run_id),
         }
     files = sorted(p.name for p in d.iterdir() if p.is_file())
     def fileurl(name: str) -> str:
@@ -381,6 +426,86 @@ def artifacts_for(run_id: str) -> dict:
         "images": [fileurl(f) for f in files if f.startswith("img_")],
         "videos": [fileurl(f) for f in files if f.startswith("vid_") and f.endswith(".mp4")],
         "merged": fileurl("merge.mp4") if "merge.mp4" in files else None,
+        "product_video": _product_video_artifacts(run_id),
+    }
+
+
+def _product_video_artifacts(run_id: str) -> dict:
+    """Index product-video pipeline artifacts: plan, briefs, starters, last frames,
+    user-uploaded product images, scraped page JSON, and approval state."""
+    d = OUTPUT_DIR / run_id
+    if not d.exists():
+        return {
+            "plan": None,
+            "briefs": [],
+            "starters": [],
+            "last_frames": [],
+            "product_images": [],
+            "scraped_text": None,
+            "approvals": {"awaiting": None, "approved": [], "rejected": []},
+        }
+
+    def fileurl(rel: str) -> str:
+        return f"/files/{run_id}/{rel}"
+
+    plan = fileurl("plan.json") if (d / "plan.json").exists() else None
+
+    briefs_dir = d / "briefs"
+    briefs: list[str] = []
+    if briefs_dir.is_dir():
+        briefs = sorted(
+            fileurl(f"briefs/{p.name}")
+            for p in briefs_dir.iterdir()
+            if p.is_file() and p.name.startswith("brief_") and p.name.endswith(".json")
+        )
+
+    starters = sorted(fileurl(p.name) for p in d.glob("starter_*.png") if p.is_file())
+    last_frames = sorted(fileurl(p.name) for p in d.glob("last_frame_*.png") if p.is_file())
+
+    product_images: list[str] = []
+    p_images_dir = d / "product" / "images"
+    if p_images_dir.is_dir():
+        product_images = sorted(
+            fileurl(f"product/images/{p.name}")
+            for p in p_images_dir.iterdir()
+            if p.is_file() and not p.name.startswith(".")
+        )
+
+    scraped = d / "product" / "scraped" / "page.json"
+    scraped_text = fileurl("product/scraped/page.json") if scraped.exists() else None
+
+    approvals_dir = d / "approvals"
+    approved: list[int] = []
+    rejected: list[int] = []
+    awaiting: int | None = None
+    if approvals_dir.is_dir():
+        for p in approvals_dir.iterdir():
+            m = re.match(r"clip_(\d+)\.(approved|rejected)$", p.name)
+            if not m:
+                continue
+            idx = int(m.group(1))
+            if m.group(2) == "approved":
+                approved.append(idx)
+            else:
+                rejected.append(idx)
+        approved.sort()
+        rejected.sort()
+    bus = BUSES.get(run_id)
+    if bus is not None:
+        for ev in reversed(bus.events[-200:]):
+            if ev.get("kind") == "awaiting_approval":
+                cand = (ev.get("payload") or {}).get("clip")
+                if isinstance(cand, int) and cand not in approved and cand not in rejected:
+                    awaiting = cand
+                break
+    return {
+        "plan": plan,
+        "briefs": briefs,
+        "starters": starters,
+        "last_frames": last_frames,
+        "product_images": product_images,
+        "scraped_text": scraped_text,
+        "approvals": {"awaiting": awaiting, "approved": approved, "rejected": rejected},
     }
 
 
@@ -457,9 +582,15 @@ def run_dict(run_id: str) -> dict:
         "clip_duration_s": int(meta.get("clip_duration_s") or 10),
         "max_words": meta.get("max_words"),
         "manual_mode": bool(meta.get("manual_mode")),
+        # Surfaced for product_video runs so RunView can route per-clip approvals.
+        "review_mode": meta.get("review_mode") if meta.get("review_mode") in ("auto", "per_clip") else None,
     }
+    kind = meta.get("kind") if isinstance(meta.get("kind"), str) else "object_talk"
+    if kind not in ("object_talk", "product_video"):
+        kind = "object_talk"
     return {
         "id": run_id,
+        "kind": kind,
         "subject": subject,
         "status": status,
         "current_step": bus.current_step if bus else None,
@@ -1933,11 +2064,326 @@ def put_scripts(run_id: str, body: ScriptsPayload) -> dict:
     return merged
 
 
-@app.get("/files/{run_id}/{filename}")
+# ---------- Product-video flow ----------
+
+_PRODUCT_IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+_PRODUCT_VID_EXTS = {".mp4", ".mov", ".webm", ".mkv", ".m4v"}
+_PRODUCT_IMG_MIME = {
+    "image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp",
+    "image/gif": ".gif", "image/bmp": ".bmp",
+}
+_PRODUCT_VID_MIME = {
+    "video/mp4": ".mp4", "video/quicktime": ".mov", "video/webm": ".webm",
+    "video/x-matroska": ".mkv",
+}
+
+
+def _safe_upload_ext(upload: UploadFile, allowed: set[str],
+                     mime_map: dict[str, str], default: str) -> str:
+    """Pick a safe file extension for an UploadFile based on filename + content-type."""
+    name = (upload.filename or "").lower()
+    ext = Path(name).suffix
+    if ext in allowed:
+        return ".jpg" if ext == ".jpeg" else ext
+    ct = (upload.content_type or "").lower()
+    mapped = mime_map.get(ct)
+    if mapped:
+        return mapped
+    return default
+
+
+def _atomic_write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    os.replace(tmp, path)
+
+
+@app.post("/api/products")
+async def create_product(
+    company_name: str = Form(...),
+    product_name: str = Form(...),
+    product_description: str | None = Form(None),
+    target_audience: str | None = Form(None),
+    tone: str | None = Form(None),
+    feeling_to_evoke: str | None = Form(None),
+    vision_statement: str | None = Form(None),
+    visual_style_preference: str | None = Form(None),
+    language: str = Form("hi"),
+    total_duration_s: int = Form(50),
+    clip_duration_s: int = Form(10),
+    voice_tone: str | None = Form(None),
+    voice_type: str | None = Form(None),
+    structure_hook_prompt: str | None = Form(None),
+    structure_middle_prompt: str | None = Form(None),
+    structure_cta_prompt: str | None = Form(None),
+    website_url: str | None = Form(None),
+    product_images: list[UploadFile] = File(default=[]),
+    product_videos: list[UploadFile] = File(default=[]),
+) -> dict:
+    """Create a product brief + save uploaded media. Returns the new run_id
+    (slug of product_name) and the persisted brief dict. Does NOT start the
+    pipeline — call POST /api/runs/{run_id}/product-video for that."""
+    if not product_name.strip():
+        raise HTTPException(400, "product_name is required")
+    run_id = slug_of(product_name)
+    if not run_id:
+        raise HTTPException(400, "product_name produced an empty slug")
+
+    product_dir = OUTPUT_DIR / run_id / "product"
+    images_dir = product_dir / "images"
+    videos_dir = product_dir / "videos"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    videos_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_image_paths: list[str] = []
+    saved_video_paths: list[str] = []
+
+    imgs = (product_images or [])[:10]
+    for i, up in enumerate(imgs, start=1):
+        if up is None or not up.filename:
+            continue
+        ext = _safe_upload_ext(up, _PRODUCT_IMG_EXTS, _PRODUCT_IMG_MIME, ".png")
+        dest = images_dir / f"img_{i:02d}{ext}"
+        with dest.open("wb") as f:
+            while True:
+                chunk = await up.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+        await up.close()
+        saved_image_paths.append(f"product/images/{dest.name}")
+
+    vids = (product_videos or [])[:3]
+    for i, up in enumerate(vids, start=1):
+        if up is None or not up.filename:
+            continue
+        ext = _safe_upload_ext(up, _PRODUCT_VID_EXTS, _PRODUCT_VID_MIME, ".mp4")
+        dest = videos_dir / f"vid_{i:02d}{ext}"
+        with dest.open("wb") as f:
+            while True:
+                chunk = await up.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+        await up.close()
+        saved_video_paths.append(f"product/videos/{dest.name}")
+
+    brief = {
+        "company_name": company_name,
+        "product_name": product_name,
+        "product_description": product_description or "",
+        "target_audience": target_audience or "",
+        "tone": tone or "",
+        "feeling_to_evoke": (feeling_to_evoke or "").strip(),
+        "vision_statement": (vision_statement or "").strip(),
+        "visual_style_preference": (visual_style_preference or "").strip(),
+        "language": language,
+        "total_duration_s": int(total_duration_s),
+        "clip_duration_s": int(clip_duration_s),
+        "voice_tone": voice_tone or "",
+        "voice_type": voice_type or "",
+        "structure_hook_prompt": structure_hook_prompt or "",
+        "structure_middle_prompt": structure_middle_prompt or "",
+        "structure_cta_prompt": structure_cta_prompt or "",
+        "website_url": website_url or "",
+        "product_images": saved_image_paths,
+        "product_videos": saved_video_paths,
+    }
+    _atomic_write_json(product_dir / "brief.json", brief)
+
+    _save_run_meta(
+        run_id,
+        kind="product_video",
+        product_name=product_name,
+        company_name=company_name,
+        language=language,
+        total_duration_s=int(total_duration_s),
+        clip_duration_s=int(clip_duration_s),
+        website_url=website_url or "",
+    )
+    return {"run_id": run_id, "product": brief}
+
+
+class ProductVideoRunOptions(BaseModel):
+    review_mode: str = "auto"            # "auto" | "per_clip"
+    clip_count: int = 5
+    clip_duration_s: int = 10
+    skip_upload: bool = False
+    privacy: str = "public"
+    parallel: bool = False
+    headless: bool = False
+
+
+@app.post("/api/runs/{run_id}/product-video")
+async def start_product_video(run_id: str, opts: ProductVideoRunOptions) -> dict:
+    d = OUTPUT_DIR / run_id
+    if not d.exists() or not (d / "product" / "brief.json").exists():
+        raise HTTPException(404, "no product brief for this run — POST /api/products first")
+    if opts.review_mode not in ("auto", "per_clip"):
+        raise HTTPException(400, "review_mode must be 'auto' or 'per_clip'")
+    if run_id in JOBS and JOBS[run_id].is_active:
+        raise HTTPException(409, f"already running: {run_id}")
+
+    _save_run_meta(
+        run_id,
+        kind="product_video",
+        review_mode=opts.review_mode,
+        clip_count=opts.clip_count,
+        clip_duration_s=opts.clip_duration_s,
+        skip_upload=opts.skip_upload,
+        privacy=opts.privacy,
+        parallel=opts.parallel,
+        headless=opts.headless,
+    )
+
+    cmd = [
+        PYTHON, "-u", str(PRODUCT_PIPELINE_SCRIPT), run_id,
+        "--review-mode", opts.review_mode,
+        "--clip-count", str(opts.clip_count),
+        "--clip-duration-s", str(opts.clip_duration_s),
+        "--privacy", opts.privacy,
+    ]
+    if opts.skip_upload:
+        cmd.append("--skip-upload")
+    if opts.parallel:
+        cmd.append("--parallel")
+    if opts.headless:
+        cmd.append("--headless")
+
+    try:
+        brief = json.loads((d / "product" / "brief.json").read_text())
+        subject = brief.get("product_name") or run_id
+    except Exception:
+        subject = run_id
+
+    job = Job(run_id, cmd, primary=True, subject=subject,
+              extra_env={"PRODUCT_RUN_ID": run_id})
+    JOBS[run_id] = job
+    job.start()
+    return run_dict(run_id)
+
+
+@app.get("/api/runs/{run_id}/plan")
+def get_plan(run_id: str) -> dict:
+    p = OUTPUT_DIR / run_id / "plan.json"
+    if not p.exists():
+        raise HTTPException(404, "no plan.json yet")
+    try:
+        return json.loads(p.read_text())
+    except Exception as e:
+        raise HTTPException(500, f"plan.json is not valid JSON: {e}")
+
+
+@app.put("/api/runs/{run_id}/plan")
+async def put_plan(run_id: str, request: Request) -> dict:
+    d = OUTPUT_DIR / run_id
+    if not d.exists():
+        raise HTTPException(404, "no such run")
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(400, "body must be JSON")
+    if not isinstance(data, dict):
+        raise HTTPException(400, "plan must be a JSON object")
+    _atomic_write_json(d / "plan.json", data)
+    return data
+
+
+@app.get("/api/runs/{run_id}/brief/{idx}")
+def get_brief(run_id: str, idx: int) -> dict:
+    if idx < 1:
+        raise HTTPException(400, "idx must be >= 1")
+    p = OUTPUT_DIR / run_id / "briefs" / f"brief_{idx:02d}.json"
+    if not p.exists():
+        raise HTTPException(404, f"no brief_{idx:02d}.json")
+    try:
+        return json.loads(p.read_text())
+    except Exception as e:
+        raise HTTPException(500, f"brief_{idx:02d}.json is not valid JSON: {e}")
+
+
+@app.put("/api/runs/{run_id}/brief/{idx}")
+async def put_brief(run_id: str, idx: int, request: Request) -> dict:
+    if idx < 1:
+        raise HTTPException(400, "idx must be >= 1")
+    d = OUTPUT_DIR / run_id
+    if not d.exists():
+        raise HTTPException(404, "no such run")
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(400, "body must be JSON")
+    if not isinstance(data, dict):
+        raise HTTPException(400, "brief must be a JSON object")
+    _atomic_write_json(d / "briefs" / f"brief_{idx:02d}.json", data)
+    return data
+
+
+class ClipRejectBody(BaseModel):
+    reason: str | None = None
+    edit_brief: dict | None = None
+
+
+@app.post("/api/runs/{run_id}/approve/{idx}")
+async def approve_clip(run_id: str, idx: int) -> dict:
+    if idx < 1:
+        raise HTTPException(400, "idx must be >= 1")
+    d = OUTPUT_DIR / run_id
+    if not d.exists():
+        raise HTTPException(404, "no such run")
+    approvals = d / "approvals"
+    approvals.mkdir(parents=True, exist_ok=True)
+    # Clear any prior rejection sentinel so a re-approval supersedes it.
+    (approvals / f"clip_{idx:02d}.rejected").unlink(missing_ok=True)
+    (approvals / f"clip_{idx:02d}.approved").touch()
+    bus = BUSES.get(run_id)
+    if bus is not None:
+        bus.emit("approved", {"clip": idx})
+    return {"ok": True}
+
+
+@app.post("/api/runs/{run_id}/reject/{idx}")
+async def reject_clip(run_id: str, idx: int, body: ClipRejectBody) -> dict:
+    if idx < 1:
+        raise HTTPException(400, "idx must be >= 1")
+    d = OUTPUT_DIR / run_id
+    if not d.exists():
+        raise HTTPException(404, "no such run")
+    if body.edit_brief is not None:
+        if not isinstance(body.edit_brief, dict):
+            raise HTTPException(400, "edit_brief must be a JSON object")
+        _atomic_write_json(d / "briefs" / f"brief_{idx:02d}.json", body.edit_brief)
+    # Wipe artifacts for this clip so the pipeline regenerates them after pickup.
+    (d / f"starter_{idx:02d}.png").unlink(missing_ok=True)
+    (d / f"last_frame_{idx:02d}.png").unlink(missing_ok=True)
+    for v in d.glob(f"vid_{idx:02d}_*.mp4"):
+        v.unlink(missing_ok=True)
+    approvals = d / "approvals"
+    approvals.mkdir(parents=True, exist_ok=True)
+    (approvals / f"clip_{idx:02d}.approved").unlink(missing_ok=True)
+    (approvals / f"clip_{idx:02d}.rejected").write_text(body.reason or "")
+    return {"ok": True}
+
+
+@app.get("/files/{run_id}/{filename:path}")
 async def serve_artifact(run_id: str, filename: str):
-    if "/" in filename or ".." in filename:
+    # Allow nested paths (e.g. product/images/img_01.png, briefs/brief_01.json)
+    # but reject anything that could escape the run dir or expose dotfiles.
+    if not filename or filename.startswith("/") or ".." in filename.split("/"):
         raise HTTPException(400, "bad filename")
-    p = OUTPUT_DIR / run_id / filename
+    for seg in filename.split("/"):
+        if not seg or seg.startswith("."):
+            raise HTTPException(400, "bad filename")
+    run_root = (OUTPUT_DIR / run_id).resolve()
+    try:
+        p = (OUTPUT_DIR / run_id / filename).resolve()
+    except Exception:
+        raise HTTPException(400, "bad filename")
+    try:
+        p.relative_to(run_root)
+    except ValueError:
+        raise HTTPException(400, "bad filename")
     if not p.exists() or not p.is_file():
         raise HTTPException(404, "not found")
     return FileResponse(str(p))

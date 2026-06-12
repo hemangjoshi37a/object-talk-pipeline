@@ -7,15 +7,20 @@ import { RunView } from './components/RunView';
 import { IdeasPanel } from './components/IdeasPanel';
 import { TrendingPanel } from './components/TrendingPanel';
 import { Settings } from './components/Settings';
+import { ProductBriefForm } from './components/ProductBriefForm';
 
 // Hash-based router (no react-router dep). Single source of truth: location.hash.
 // URL scheme — paste-able + refresh-safe:
-//   #/                       → Auto run landing (default)
+//   #/                       → Object Talk run landing (default)
+//   #/product                → Product Video landing
 //   #/manual                 → Manual run landing
 //   #/settings               → Settings page
 //   #/run/<id>               → Run detail page
+type LandingMode = 'product' | 'auto' | 'manual' | 'settings';
+
 type Route =
   | { kind: 'auto' }
+  | { kind: 'product' }
   | { kind: 'manual' }
   | { kind: 'settings' }
   | { kind: 'run'; id: string };
@@ -23,6 +28,7 @@ type Route =
 function parseHash(hash: string): Route {
   const h = hash.replace(/^#\/?/, '');
   if (!h) return { kind: 'auto' };
+  if (h === 'product') return { kind: 'product' };
   if (h === 'manual') return { kind: 'manual' };
   if (h === 'settings') return { kind: 'settings' };
   const m = h.match(/^run\/([^/?]+)/);
@@ -32,10 +38,18 @@ function parseHash(hash: string): Route {
 
 function routeToHash(r: Route): string {
   if (r.kind === 'auto') return '#/';
+  if (r.kind === 'product') return '#/product';
   if (r.kind === 'manual') return '#/manual';
   if (r.kind === 'settings') return '#/settings';
   return `#/run/${encodeURIComponent(r.id)}`;
 }
+
+const TABS: { mode: LandingMode; label: string }[] = [
+  { mode: 'product', label: 'Product Video' },
+  { mode: 'auto', label: 'Object Talk' },
+  { mode: 'manual', label: 'Manual' },
+  { mode: 'settings', label: 'Settings' },
+];
 
 export default function App() {
   const [runs, setRuns] = useState<Run[]>([]);
@@ -46,7 +60,7 @@ export default function App() {
   const [currentRun, setCurrentRun] = useState<Run | null>(null);
   const [logs, setLogs] = useState<LogLine[]>([]);
   const [pendingSubject, setPendingSubject] = useState('');
-  const [mode, setMode] = useState<'auto' | 'manual' | 'settings'>(
+  const [mode, setMode] = useState<LandingMode>(
     initialRoute.kind === 'run' ? 'auto' : initialRoute.kind,
   );
   const sseRef = useRef<EventSource | null>(null);
@@ -233,11 +247,51 @@ export default function App() {
       if (e.kind === 'artifact') {
         next.artifacts = { ...next.artifacts, ...e.payload };
       }
+      if (e.kind === 'awaiting_approval') {
+        const clip = (e.payload as any)?.clip ?? null;
+        const pv = next.artifacts.product_video;
+        if (pv) {
+          next.artifacts = {
+            ...next.artifacts,
+            product_video: {
+              ...pv,
+              approvals: { ...pv.approvals, awaiting: clip },
+            },
+          };
+        }
+      }
+      if (e.kind === 'approved') {
+        const clip = (e.payload as any)?.clip;
+        const pv = next.artifacts.product_video;
+        if (pv && typeof clip === 'number') {
+          const approved = pv.approvals.approved.includes(clip)
+            ? pv.approvals.approved
+            : [...pv.approvals.approved, clip].sort((a, b) => a - b);
+          next.artifacts = {
+            ...next.artifacts,
+            product_video: {
+              ...pv,
+              approvals: {
+                ...pv.approvals,
+                approved,
+                awaiting: pv.approvals.awaiting === clip ? null : pv.approvals.awaiting,
+              },
+            },
+          };
+        }
+      }
       return next;
     });
+    // The artifact scanner emits a full `artifact` event whenever the run dir
+    // changes (plan.json, briefs/, starter_*.png, etc.) so the product-video
+    // pane refreshes itself on those. The events below are mostly cosmetic
+    // markers; we just trigger a list refresh on terminal status changes.
     if (e.kind === 'status' && (e.payload === 'done' || e.payload === 'error' || e.payload === 'cancelled')) {
       refreshList();
     }
+    // On plan_ready / clip_brief_ready, the scanner picks up the files within
+    // 2s — RunView's plan/briefs effects re-fetch the JSON content when the
+    // artifact list updates. No additional fetch needed here.
   };
 
   const onNewRun = async (opts: any) => {
@@ -290,7 +344,7 @@ export default function App() {
       <Sidebar
         runs={runs}
         selectedId={selectedId}
-        mode={mode}
+        mode={mode === 'product' ? 'auto' : mode}
         onSelect={id => { setSelectedId(id); }}
         onNew={() => { setSelectedId(null); setMode('auto'); }}
         onManual={() => { setSelectedId(null); setMode('manual'); }}
@@ -300,8 +354,29 @@ export default function App() {
       <main className="flex-1 min-w-0 flex flex-col overflow-hidden">
         {selectedId === null ? (
           <div className="flex-1 overflow-y-auto">
+            <div className="sticky top-0 z-10 flex w-full border-b border-zinc-800 bg-zinc-950/40 backdrop-blur-md">
+              {TABS.map(t => {
+                const active = mode === t.mode;
+                return (
+                  <button
+                    key={t.mode}
+                    type="button"
+                    onClick={() => setMode(t.mode)}
+                    className={`px-4 py-2.5 text-sm font-medium border-b-2 transition ${
+                      active
+                        ? 'border-emerald-500 text-emerald-300 bg-emerald-500/5'
+                        : 'border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-zinc-900/50'
+                    }`}
+                  >
+                    {t.label}
+                  </button>
+                );
+              })}
+            </div>
             {mode === 'settings' ? (
               <Settings />
+            ) : mode === 'product' ? (
+              <ProductBriefForm />
             ) : (
               <>
                 {mode === 'auto' ? (

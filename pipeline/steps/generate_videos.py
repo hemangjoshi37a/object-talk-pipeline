@@ -203,13 +203,27 @@ def _set_aspect_9_16(page) -> None:
     page.keyboard.press("Escape")
 
 
-def _upload_image(page, image_path: Path) -> None:
-    """Set the hidden file input to upload the image."""
+def _upload_images(page, paths: list[Path]) -> None:
+    """Set the hidden file input to upload one OR MORE images in a single call.
+
+    Grok's file input is `<input type="file" name="files" multiple>` — passing a
+    list to set_input_files attaches them all. Order matters: the FIRST entry
+    becomes Grok's primary visual anchor in product-mode (the real product
+    photo), the SECOND is the chained starter frame.
+    """
+    valid = [p for p in paths if p and p.exists()]
+    if not valid:
+        return
     file_inputs = page.locator('input[type="file"][name="files"]')
     if not file_inputs.count():
         file_inputs = page.locator('input[type="file"]')
-    file_inputs.first.set_input_files(str(image_path))
+    file_inputs.first.set_input_files([str(p) for p in valid])
     page.wait_for_timeout(1500)  # let preview render
+
+
+def _upload_image(page, image_path: Path) -> None:
+    """Single-image convenience wrapper around _upload_images."""
+    _upload_images(page, [image_path])
 
 
 def _human_jitter(page, near_x: int | None = None, near_y: int | None = None) -> None:
@@ -731,7 +745,7 @@ def _ensure_fresh_chat(page) -> None:
     _dismiss_consent_banner(page)
 
 
-def _setup_and_submit(page, image_path: Path | None, prompt: str) -> set[str]:
+def _setup_and_submit(page, image_paths: list[Path] | Path | None, prompt: str) -> set[str]:
     """The setup phase: reset, configure, upload, prompt, submit.
 
     Returns the set of video URLs that existed in the DOM AT THE INSTANT of
@@ -739,8 +753,10 @@ def _setup_and_submit(page, image_path: Path | None, prompt: str) -> set[str]:
     entries (otherwise the picker grabs a 6s anonymous preview from a prior
     attempt).
 
-    `image_path` may be None — text-only video mode (prompt carries the
-    character description).
+    `image_paths` may be:
+      • None              — text-only video mode (prompt carries the character description)
+      • a single Path     — single-image upload (legacy object-talk path)
+      • a list[Path]      — multi-image upload (product-mode: product anchor + starter)
     """
     _ensure_fresh_chat(page)
     # Quota check BEFORE we even try to set up — if Grok's landing page already
@@ -752,8 +768,11 @@ def _setup_and_submit(page, image_path: Path | None, prompt: str) -> set[str]:
     _set_aspect_9_16(page)
     _set_resolution(page, "720p")
     _set_duration(page, "10s")
-    if image_path is not None:
-        _upload_image(page, image_path)
+    if image_paths is not None:
+        if isinstance(image_paths, Path):
+            _upload_images(page, [image_paths])
+        else:
+            _upload_images(page, list(image_paths))
     _set_prompt(page, prompt)
     # Snapshot the existing video URLs RIGHT before submit — anything we find
     # later that's NOT in this set is a genuinely new generation, not a stale
@@ -771,9 +790,21 @@ def _setup_and_submit(page, image_path: Path | None, prompt: str) -> set[str]:
     return baseline
 
 
-def generate_one(page, image_path: Path | None, prompt: str, out_path: Path) -> None:
-    print(f"  · setup + submit{' (text-only)' if image_path is None else ''}")
-    baseline = _setup_and_submit(page, image_path, prompt)
+def generate_one(page, image_paths: list[Path] | Path | None, prompt: str, out_path: Path) -> None:
+    if image_paths is None:
+        n = 0
+    elif isinstance(image_paths, Path):
+        n = 1
+    else:
+        n = len(image_paths)
+    if n == 0:
+        suffix = " (text-only)"
+    elif n == 1:
+        suffix = ""
+    else:
+        suffix = f" ({n} images)"
+    print(f"  · setup + submit{suffix}")
+    baseline = _setup_and_submit(page, image_paths, prompt)
     print(f"  · waiting for navigation to settle...")
     page.wait_for_timeout(1500)
     _dump_post_gen_state(page, f"after_submit_{int(time.time())}")
@@ -786,10 +817,16 @@ def generate_one(page, image_path: Path | None, prompt: str, out_path: Path) -> 
 
 
 def _collect_pending(scripts, out_dir: Path, only):
-    """Return [(idx, script, image_path|None, out_path), ...] for items that need work.
+    """Return [(idx, script, image_paths|None, out_path), ...] for items that need work.
+
+    image_paths is a list of Path objects in the order they should be uploaded.
+    Product-mode runs additionally yield img_NN_product.<ext> as the FIRST entry
+    (so Grok sees the real product photo as its primary anchor) followed by the
+    starter frame. Legacy object-talk runs only have img_NN_<slug>.png and get
+    a single-element list — unchanged behaviour.
 
     When SKIP_IMAGES is set, missing images are tolerated and the slot is queued
-    with image_path=None — Grok then runs in text-only video mode.
+    with image_paths=None — Grok then runs in text-only video mode.
     """
     pending = []
     for i, s in enumerate(scripts, 1):
@@ -800,15 +837,25 @@ def _collect_pending(scripts, out_dir: Path, only):
         if out.exists() and out.stat().st_size > 1024:
             print(f"[{i}/5] {s['object']}: skip (already exists)", flush=True)
             continue
-        img_candidates = list(out_dir.glob(f"img_{i:02d}_*"))
-        img: Path | None
-        if img_candidates:
-            img = img_candidates[0]
+        # Two slot kinds:
+        #   img_NN_product.*  — real product photo (anchor) — uploaded FIRST
+        #   img_NN_*          — any other (starter / object-talk image)
+        product_matches = sorted(out_dir.glob(f"img_{i:02d}_product.*"))
+        other_matches = [p for p in sorted(out_dir.glob(f"img_{i:02d}_*"))
+                         if p not in product_matches]
+        imgs: list[Path] | None
+        if product_matches and other_matches:
+            # Order matters: product anchor first, starter frame second.
+            imgs = [product_matches[0], other_matches[0]]
+        elif other_matches:
+            imgs = [other_matches[0]]
+        elif product_matches:
+            imgs = [product_matches[0]]
         elif SKIP_IMAGES:
-            img = None
+            imgs = None
         else:
             raise FileNotFoundError(f"No image for script #{i} ({s['object']}) in {out_dir}")
-        pending.append((i, s, img, out))
+        pending.append((i, s, imgs, out))
     return pending
 
 
@@ -822,10 +869,21 @@ GROK_STYLE_GUARD = (
 )
 
 
-def _build_grok_prompt(s: dict, include_character: bool = True) -> str:
+PRODUCT_FIDELITY_DUAL_UPLOAD_LINE = (
+    "PRODUCT FIDELITY: the FIRST uploaded image is the EXACT product (preserve "
+    "its logo, screen readouts, LEDs, buttons, and silhouette exactly). The "
+    "SECOND uploaded image is the first-frame scene; generate motion from that "
+    "starting point."
+)
+
+
+def _build_grok_prompt(s: dict, include_character: bool = True,
+                       image_count: int = 1) -> str:
     """Build the full prompt typed into Grok's text box for a single clip.
 
     Sections (each labelled so Grok knows what role each plays):
+      PRODUCT FIDELITY — (product-mode + 2 images only) tells Grok which
+                         uploaded image is the product vs the first frame
       STYLE    — guards against drift to a realistic human figure
       SUBJECT  — character's visual description (carried in prompt even when
                  an image is uploaded, since the visual anchor sometimes still
@@ -837,7 +895,23 @@ def _build_grok_prompt(s: dict, include_character: bool = True) -> str:
     action = (s.get("action_script") or "").strip()
     character = (s.get("image_prompt") or "").strip() if include_character else ""
 
-    parts = [GROK_STYLE_GUARD]
+    # Product-mode runs (pipeline_product.py) set PRODUCT_RUN_ID and supply
+    # their own PRODUCT_STYLE_GUARD derived from plan.global. The legacy
+    # Object-Talk pipeline leaves both unset, so it keeps the Pixar guard.
+    is_product_run = bool(os.environ.get("PRODUCT_RUN_ID"))
+    if is_product_run:
+        style_guard = os.environ.get("PRODUCT_STYLE_GUARD", "")
+    else:
+        style_guard = GROK_STYLE_GUARD
+
+    parts: list[str] = []
+    # Only emit the dual-upload fidelity hint when BOTH a product image and a
+    # starter image are actually being uploaded — otherwise the line lies about
+    # which slot is which and confuses Grok.
+    if is_product_run and image_count >= 2:
+        parts.append(PRODUCT_FIDELITY_DUAL_UPLOAD_LINE)
+    if style_guard:
+        parts.append(style_guard)
     if character:
         parts.append(
             "SUBJECT (the visual character — render this exactly):\n"
@@ -882,7 +956,9 @@ def _generate_parallel(ctx, pending) -> list[Path]:
             continue
         print(f"[{idx}/5] {s['object']}: setup tab {slot+1}", flush=True)
         try:
-            baselines[slot] = _setup_and_submit(pages[slot], img, _build_grok_prompt(s, include_character=True))
+            n_imgs = 0 if img is None else (1 if isinstance(img, Path) else len(img))
+            prompt = _build_grok_prompt(s, include_character=True, image_count=n_imgs)
+            baselines[slot] = _setup_and_submit(pages[slot], img, prompt)
             submitted[slot] = True
         except GrokQuotaExceeded as e:
             setup_errors[slot] = str(e)[:300]
@@ -1027,7 +1103,9 @@ def generate_all(scripts_json: Path, out_dir: Path, headless: bool = False,
                         continue
                     print(f"[{idx}/5] {s['object']} (serial retry)", flush=True)
                     try:
-                        generate_one(page, img, _build_grok_prompt(s, include_character=True), out)
+                        n_imgs = 0 if img is None else (1 if isinstance(img, Path) else len(img))
+                        prompt = _build_grok_prompt(s, include_character=True, image_count=n_imgs)
+                        generate_one(page, img, prompt, out)
                         outputs.append(out)
                     except GrokQuotaExceeded as e:
                         print(f"  ⛔ {e} — stopping further attempts.", flush=True)
@@ -1042,7 +1120,9 @@ def generate_all(scripts_json: Path, out_dir: Path, headless: bool = False,
                     continue
                 print(f"[{idx}/5] {s['object']}", flush=True)
                 try:
-                    generate_one(page, img, _build_grok_prompt(s, include_character=True), out)
+                    n_imgs = 0 if img is None else (1 if isinstance(img, Path) else len(img))
+                    prompt = _build_grok_prompt(s, include_character=True, image_count=n_imgs)
+                    generate_one(page, img, prompt, out)
                     outputs.append(out)
                 except GrokQuotaExceeded as e:
                     print(f"  ⛔ {e}", flush=True)
